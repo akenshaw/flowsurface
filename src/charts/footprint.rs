@@ -96,6 +96,7 @@ pub struct FootprintChart {
     raw_trades: Vec<Trade>,
     indicators: Vec<Indicators>,
     fetching_oi: bool,
+    fetching_trades: bool,
     request_handler: RequestHandler,
 }
 
@@ -178,39 +179,8 @@ impl FootprintChart {
                 Indicators::OpenInterest(Caches::default(), BTreeMap::new()),
             ],
             fetching_oi: false,
+            fetching_trades: false,
             request_handler: RequestHandler::new(),
-        }
-    }
-
-    pub fn insert_datapoint(&mut self, trades_buffer: &[Trade], depth_update: i64) {
-        let (tick_size, aggregate_time) = {
-            let chart = self.get_common_data();
-            (chart.tick_size, chart.timeframe as i64)
-        };
-
-        let rounded_depth_update = (depth_update / aggregate_time) * aggregate_time;
-
-        self.data_points
-            .entry(rounded_depth_update)
-            .or_insert((HashMap::new(), Kline::default()));
-
-        for trade in trades_buffer {
-            let price_level = OrderedFloat(round_to_tick(trade.price, tick_size));
-            if let Some((trades, _)) = self.data_points.get_mut(&rounded_depth_update) {
-                if let Some((buy_qty, sell_qty)) = trades.get_mut(&price_level) {
-                    if trade.is_sell {
-                        *sell_qty += trade.qty;
-                    } else {
-                        *buy_qty += trade.qty;
-                    }
-                } else if trade.is_sell {
-                    trades.insert(price_level, (0.0, trade.qty));
-                } else {
-                    trades.insert(price_level, (trade.qty, 0.0));
-                }
-            }
-
-            self.raw_trades.push(*trade);
         }
     }
 
@@ -273,6 +243,26 @@ impl FootprintChart {
             }
         }
 
+        if !self.fetching_trades {
+            let (kline_earliest, _) = self.get_trades_timerange(kline_latest);
+
+            if visible_earliest < kline_earliest {
+                let trade_earliest = self.raw_trades.iter()
+                    .filter(|trade| trade.time >= kline_earliest)
+                    .map(|trade| trade.time)
+                    .min();
+            
+                if let Some(earliest) = trade_earliest {
+                    if let Some(task) = request_fetch(
+                        &mut self.request_handler, FetchRange::Trades(visible_earliest, earliest)
+                    ) {
+                        self.fetching_trades = true;
+                        return task;
+                    }
+                }
+            }
+        }
+
         for indicator in &self.indicators {
             if let Indicators::OpenInterest(_, _) = indicator {
                 if !self.fetching_oi {
@@ -318,6 +308,56 @@ impl FootprintChart {
         self.raw_trades.clone()
     }
 
+    pub fn clear_trades(&mut self, clear_raw: bool) {
+        self.data_points.iter_mut().for_each(|(_, (trades, _))| {
+            trades.clear();
+        });
+
+        if clear_raw {
+            self.raw_trades.clear();
+        } else {
+            let aggregate_time = self.chart.timeframe as i64;
+            let tick_size = self.chart.tick_size;
+
+            for trade in &self.raw_trades {
+                let rounded_time = (trade.time / aggregate_time) * aggregate_time;
+                let price_level = OrderedFloat(round_to_tick(trade.price, tick_size));
+    
+                let entry = self.data_points
+                    .entry(rounded_time)
+                    .or_insert((HashMap::new(), Kline::default()));
+    
+                if let Some((buy_qty, sell_qty)) = entry.0.get_mut(&price_level) {
+                    if trade.is_sell {
+                        *sell_qty += trade.qty;
+                    } else {
+                        *buy_qty += trade.qty;
+                    }
+                } else if trade.is_sell {
+                    entry.0.insert(price_level, (0.0, trade.qty));
+                } else {
+                    entry.0.insert(price_level, (trade.qty, 0.0));
+                }
+            }
+        }
+    }
+
+    pub fn get_tick_size(&self) -> f32 {
+        self.chart.tick_size
+    }
+
+    pub fn change_tick_size(&mut self, new_tick_size: f32) {
+        let chart = self.get_common_data_mut();
+        let old_tick_size = chart.tick_size;
+
+        chart.base_range *= new_tick_size / old_tick_size;
+        chart.cell_height *= new_tick_size / old_tick_size;
+
+        chart.tick_size = new_tick_size;
+
+        self.clear_trades(false);
+    }
+
     fn get_kline_timerange(&self) -> (i64, i64) {
         let mut from_time = i64::MAX;
         let mut to_time = i64::MIN;
@@ -344,6 +384,85 @@ impl FootprintChart {
         });
 
         (from_time, to_time)
+    }
+
+    fn get_trades_timerange(&self, latest_kline: i64) -> (i64, i64) {
+        let mut from_time = latest_kline;
+        let mut to_time = 0;
+
+        self.data_points
+            .iter()
+            .filter(|(_, (trades, _))| !trades.is_empty())
+            .for_each(|(time, _)| {
+                from_time = from_time.min(*time);
+                to_time = to_time.max(*time);
+            });
+
+        (from_time, to_time)
+    }
+
+    pub fn insert_datapoint(&mut self, trades_buffer: &[Trade], depth_update: i64) {
+        let (tick_size, aggregate_time) = {
+            let chart = self.get_common_data();
+            (chart.tick_size, chart.timeframe as i64)
+        };
+
+        let rounded_depth_update = (depth_update / aggregate_time) * aggregate_time;
+
+        self.data_points
+            .entry(rounded_depth_update)
+            .or_insert((HashMap::new(), Kline::default()));
+
+        for trade in trades_buffer {
+            let price_level = OrderedFloat(round_to_tick(trade.price, tick_size));
+            if let Some((trades, _)) = self.data_points.get_mut(&rounded_depth_update) {
+                if let Some((buy_qty, sell_qty)) = trades.get_mut(&price_level) {
+                    if trade.is_sell {
+                        *sell_qty += trade.qty;
+                    } else {
+                        *buy_qty += trade.qty;
+                    }
+                } else if trade.is_sell {
+                    trades.insert(price_level, (0.0, trade.qty));
+                } else {
+                    trades.insert(price_level, (trade.qty, 0.0));
+                }
+            }
+        }
+
+        self.raw_trades.extend_from_slice(trades_buffer);
+    }
+
+    pub fn insert_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
+        let aggregate_time = self.chart.timeframe as i64;
+        let tick_size = self.chart.tick_size;
+
+        for trade in &raw_trades {
+            let rounded_time = (trade.time / aggregate_time) * aggregate_time;
+            let price_level = OrderedFloat(round_to_tick(trade.price, tick_size));
+
+            let entry = self.data_points
+                .entry(rounded_time)
+                .or_insert((HashMap::new(), Kline::default()));
+
+            if let Some((buy_qty, sell_qty)) = entry.0.get_mut(&price_level) {
+                if trade.is_sell {
+                    *sell_qty += trade.qty;
+                } else {
+                    *buy_qty += trade.qty;
+                }
+            } else if trade.is_sell {
+                entry.0.insert(price_level, (0.0, trade.qty));
+            } else {
+                entry.0.insert(price_level, (trade.qty, 0.0));
+            }
+        }
+
+        self.raw_trades.extend(raw_trades);
+
+        if is_batches_done {
+            self.fetching_trades = false;
+        }
     }
 
     pub fn insert_new_klines(&mut self, req_id: uuid::Uuid, klines_raw: &Vec<Kline>) {
@@ -384,31 +503,6 @@ impl FootprintChart {
         });
     
         self.fetching_oi = false;
-    }
-
-    pub fn get_tick_size(&self) -> f32 {
-        self.chart.tick_size
-    }
-
-    pub fn clear_trades(&mut self, clear_raw: bool) {
-        if clear_raw {
-            self.raw_trades.clear();
-        }
-        self.data_points.iter_mut().for_each(|(_, (trades, _))| {
-            trades.clear();
-        });
-    }
-
-    pub fn change_tick_size(&mut self, new_tick_size: f32) {
-        self.clear_trades(true);
-
-        let chart = self.get_common_data_mut();
-        let old_tick_size = chart.tick_size;
-
-        chart.base_range *= new_tick_size / old_tick_size;
-        chart.cell_height *= new_tick_size / old_tick_size;
-
-        chart.tick_size = new_tick_size;
     }
 
     fn calc_qty_scales(
