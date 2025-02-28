@@ -326,8 +326,8 @@ impl LayoutManager {
                 Space::with_width(iced::Length::Fill),
                 row![
                     tooltip(
-                        button("i").style(move |theme, status| style::button_transparent(theme, status, true)),
-                        Some("- Drag&drop to reorder layouts\n- Layouts won't be saved if app exits abruptly"),
+                        button("i").style(move |theme, status| style::button_modifier(theme, status, true)),
+                        Some("- Drag & drop to reorder layouts\n- Layouts won't be saved if app exits abruptly"),
                         tooltip::Position::Top,
                     ),
                     edit_btn,
@@ -432,7 +432,7 @@ impl LayoutManager {
                 
                 layouts_column = layouts_column.push(
                     container(layout_row)
-                        .style(style::modal_container)
+                        .style(style::layout_row_container)
                 );
             }
         }

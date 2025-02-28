@@ -14,7 +14,7 @@ use iced_futures::stream;
 
 use super::{
     setup_tcp_connection, setup_tls_connection, setup_websocket_connection, 
-    str_f32_parse, deserialize_string_to_i64, deserialize_string_to_f32,
+    str_f32_parse, de_string_to_f32, de_string_to_u64, BidAsk,
     Connection, Event, Kline, LocalDepthCache, MarketType, Order, State, Exchange, OpenInterest,
     StreamError, TickerInfo, TickerStats, Trade, VecLocalDepthCache, StreamType, Ticker, Timeframe,
 };
@@ -27,14 +27,6 @@ struct SonicDepth {
     pub bids: Vec<BidAsk>,
     #[serde(rename = "a")]
     pub asks: Vec<BidAsk>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct BidAsk {
-    #[serde(rename = "0")]
-    pub price: String,
-    #[serde(rename = "1")]
-    pub qty: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -70,7 +62,7 @@ pub struct SonicKline {
 #[derive(Debug)]
 enum StreamData {
     Trade(Vec<SonicTrade>),
-    Depth(SonicDepth, String, i64),
+    Depth(SonicDepth, String, u64),
     Kline(Ticker, Vec<SonicKline>),
 }
 
@@ -117,7 +109,7 @@ fn feed_de(
     let mut depth_wrap: Option<SonicDepth> = None;
 
     let mut data_type = String::new();
-    let mut topic_ticker = Ticker::default();
+    let mut topic_ticker: Option<Ticker> = ticker;
 
     let iter: sonic_rs::ObjectJsonIter = unsafe { to_object_iter_unchecked(slice) };
 
@@ -128,25 +120,22 @@ fn feed_de(
             if let Some(val) = v.as_str() {
                 let mut is_ticker = None;
 
-                if let Some(ticker) = ticker {
-                    is_ticker = Some(ticker);
+                if let Some(t) = ticker {
+                    is_ticker = Some(t);
                 }
 
                 match StreamName::from_topic(val, is_ticker, market_type) {
-                    StreamName::Depth(ticker) => {
+                    StreamName::Depth(t) => {
                         stream_type = Some(StreamWrapper::Depth);
-
-                        topic_ticker = ticker;
+                        topic_ticker = Some(t);
                     }
-                    StreamName::Trade(ticker) => {
+                    StreamName::Trade(t) => {
                         stream_type = Some(StreamWrapper::Trade);
-
-                        topic_ticker = ticker;
+                        topic_ticker = Some(t);
                     }
-                    StreamName::Kline(ticker) => {
+                    StreamName::Kline(t) => {
                         stream_type = Some(StreamWrapper::Kline);
-
-                        topic_ticker = ticker;
+                        topic_ticker = Some(t);
                     }
                     _ => {
                         log::error!("Unknown stream name");
@@ -180,7 +169,11 @@ fn feed_de(
                     let kline_wrap: Vec<SonicKline> = sonic_rs::from_str(&v.as_raw_faststr())
                         .map_err(|e| StreamError::ParseError(e.to_string()))?;
 
-                    return Ok(StreamData::Kline(topic_ticker, kline_wrap));
+                    if let Some(t) = topic_ticker {
+                        return Ok(StreamData::Kline(t, kline_wrap));
+                    } else {
+                        return Err(StreamError::ParseError("Missing ticker for kline data".to_string()));
+                    }
                 }
                 _ => {
                     log::error!("Unknown stream type");
@@ -192,7 +185,7 @@ fn feed_de(
                     .as_u64()
                     .ok_or_else(|| StreamError::ParseError("Failed to parse u64".to_string()))?;
 
-                return Ok(StreamData::Depth(dw, data_type.to_string(), time as i64));
+                return Ok(StreamData::Depth(dw, data_type.to_string(), time));
             }
         }
     }
@@ -306,7 +299,7 @@ pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
                                     StreamData::Trade(de_trade_vec) => {
                                         for de_trade in &de_trade_vec {
                                             let trade = Trade {
-                                                time: de_trade.time as i64,
+                                                time: de_trade.time,
                                                 is_sell: de_trade.is_sell == "Sell",
                                                 price: str_f32_parse(&de_trade.price),
                                                 qty: str_f32_parse(&de_trade.qty),
@@ -317,22 +310,22 @@ pub fn connect_market_stream(ticker: Ticker) -> impl Stream<Item = Event> {
                                     }
                                     StreamData::Depth(de_depth, data_type, time) => {
                                         let depth_update = VecLocalDepthCache {
-                                            last_update_id: de_depth.update_id as i64,
+                                            last_update_id: de_depth.update_id,
                                             time,
                                             bids: de_depth
                                                 .bids
                                                 .iter()
                                                 .map(|x| Order {
-                                                    price: str_f32_parse(&x.price),
-                                                    qty: str_f32_parse(&x.qty),
+                                                    price: x.price,
+                                                    qty: x.qty,
                                                 })
                                                 .collect(),
                                             asks: de_depth
                                                 .asks
                                                 .iter()
                                                 .map(|x| Order {
-                                                    price: str_f32_parse(&x.price),
-                                                    qty: str_f32_parse(&x.qty),
+                                                    price: x.price,
+                                                    qty: x.qty,
                                                 })
                                                 .collect(),
                                         };
@@ -490,15 +483,15 @@ fn string_to_timeframe(interval: &str) -> Option<Timeframe> {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeOpenInterest {
-    #[serde(rename = "openInterest", deserialize_with = "deserialize_string_to_f32")]
+    #[serde(rename = "openInterest", deserialize_with = "de_string_to_f32")]
     pub value: f32,
-    #[serde(deserialize_with = "deserialize_string_to_i64")]
-    pub timestamp: i64,
+    #[serde(deserialize_with = "de_string_to_u64")]
+    pub timestamp: u64,
 }
 
 pub async fn fetch_historical_oi(
     ticker: Ticker, 
-    range: Option<(i64, i64)>,
+    range: Option<(u64, u64)>,
     period: Timeframe,
 ) -> Result<Vec<OpenInterest>, StreamError> {
     let ticker_str = ticker.get_string().0.to_uppercase();
@@ -522,7 +515,7 @@ pub async fn fetch_historical_oi(
     );
 
     if let Some((start, end)) = range {
-        let interval_ms = period.to_milliseconds() as i64;
+        let interval_ms = period.to_milliseconds();
         let num_intervals = ((end - start) / interval_ms).min(200);
 
         url.push_str(&format!(
@@ -601,7 +594,7 @@ struct ApiResult {
 pub async fn fetch_klines(
     ticker: Ticker,
     timeframe: Timeframe,
-    range: Option<(i64, i64)>,
+    range: Option<(u64, u64)>,
 ) -> Result<Vec<Kline>, StreamError> {
     let (symbol_str, market_type) = &ticker.get_string();
     let timeframe_str = timeframe.to_minutes().to_string();
@@ -626,7 +619,7 @@ pub async fn fetch_klines(
     );
 
     if let Some((start, end)) = range {
-        let interval_ms = timeframe.to_milliseconds() as i64;
+        let interval_ms = timeframe.to_milliseconds();
         let num_intervals = ((end - start) / interval_ms).min(1000);
 
         url.push_str(&format!("&start={start}&end={end}&limit={num_intervals}"));

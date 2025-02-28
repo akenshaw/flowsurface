@@ -153,10 +153,10 @@ impl AxisLabel {
 pub struct AxisLabelsX<'a> {
     pub labels_cache: &'a Cache,
     pub crosshair: bool,
-    pub max: i64,
+    pub max: u64,
     pub scaling: f32,
     pub translation_x: f32,
-    pub timeframe: u32,
+    pub timeframe: u64,
     pub cell_width: f32,
     pub timezone: &'a UserTimezone,
     pub chart_bounds: Rectangle,
@@ -175,9 +175,14 @@ impl AxisLabelsX<'_> {
         }
     }
 
-    fn x_to_time(&self, x: f32) -> i64 {
-        let time_per_cell = self.timeframe;
-        self.max + ((x / self.cell_width) * time_per_cell as f32) as i64
+    fn x_to_time(&self, x: f32) -> u64 {
+        if x <= 0.0 {
+            let diff = (-x / self.cell_width * self.timeframe as f32) as u64;
+            self.max.saturating_sub(diff)
+        } else {
+            let diff = (x / self.cell_width * self.timeframe as f32) as u64;
+            self.max.saturating_add(diff)
+        }
     }
 }
 
@@ -264,6 +269,10 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
             let earliest_in_millis = self.x_to_time(region.x);
             let latest_in_millis = self.x_to_time(region.x + region.width);
 
+            if earliest_in_millis >= latest_in_millis {
+                return;
+            }
+
             let x_labels_can_fit = (bounds.width / 192.0) as i32;
 
             let mut all_labels: Vec<AxisLabel> = Vec::with_capacity(x_labels_can_fit as usize + 1); // +1 for crosshair
@@ -275,15 +284,18 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                 x_labels_can_fit,
                 self.timeframe,
             );
-            let mut time: i64 = rounded_earliest;
+            let mut time: u64 = rounded_earliest;
 
             while time <= latest_in_millis {
-                let x_position = ((time - earliest_in_millis) as f64
-                    / (latest_in_millis - earliest_in_millis) as f64)
-                    * f64::from(bounds.width);
+                let x_position = if time >= earliest_in_millis {
+                    ((time - earliest_in_millis) as f64 / (latest_in_millis - earliest_in_millis) as f64)
+                        * f64::from(bounds.width)
+                } else {
+                    0.0
+                };
 
                 if x_position >= 0.0 && x_position <= f64::from(bounds.width) {
-                    if let Some(time_as_datetime) = DateTime::from_timestamp(time / 1000, 0) {
+                    if let Some(time_as_datetime) = DateTime::from_timestamp((time / 1000) as i64, 0) {
                         let text_content = match self.timezone {
                             UserTimezone::Local => {
                                 let time_with_zone = time_as_datetime.with_timezone(&chrono::Local);
@@ -343,12 +355,10 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
                             DateTime::from_timestamp_millis(crosshair_millis as i64)
                         {
                             let rounded_timestamp = (crosshair_time.timestamp_millis() as f64
-                                / f64::from(self.timeframe))
-                            .round() as i64
-                                * i64::from(self.timeframe);
+                                / (self.timeframe as f64)).round() as u64 * self.timeframe;
 
                             if let Some(rounded_time) =
-                                DateTime::from_timestamp_millis(rounded_timestamp)
+                                DateTime::from_timestamp_millis(rounded_timestamp as i64)
                             {
                                 let snap_ratio = (rounded_timestamp as f64
                                     - earliest_in_millis as f64)
