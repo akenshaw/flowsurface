@@ -9,7 +9,7 @@ use iced::{
 
 use crate::screen::UserTimezone;
 
-use super::{Interaction, Message, round_to_tick};
+use super::{round_to_tick, ChartBasis, Interaction, Message};
 
 /// calculates `Rectangle` from given content, clamps it within bounds if needed
 pub fn calc_label_rect(
@@ -150,19 +150,300 @@ impl AxisLabel {
 }
 
 // X-AXIS LABELS
+const TEXT_SIZE: f32 = 12.0;
+
 pub struct AxisLabelsX<'a> {
     pub labels_cache: &'a Cache,
     pub crosshair: bool,
     pub max: u64,
     pub scaling: f32,
     pub translation_x: f32,
-    pub timeframe: u64,
+    pub basis: ChartBasis,
     pub cell_width: f32,
     pub timezone: &'a UserTimezone,
     pub chart_bounds: Rectangle,
+    pub interval_keys: Vec<u64>,
 }
 
 impl AxisLabelsX<'_> {
+    fn create_label(&self, 
+        position: f32, 
+        text: String, 
+        bounds: Rectangle, 
+        is_crosshair: bool,
+        palette: &Extended
+    ) -> AxisLabel {
+        let content_width = text.len() as f32 * (TEXT_SIZE / 3.0);
+
+        let rect = Rectangle {
+            x: position - content_width,
+            y: 4.0,
+            width: 2.0 * content_width,
+            height: bounds.height - 8.0,
+        };
+
+        let label = Label {
+            content: text,
+            background_color: if is_crosshair {
+                Some(palette.secondary.base.color)
+            } else {
+                None
+            },
+            text_color: if is_crosshair {
+                palette.secondary.base.text
+            } else {
+                palette.background.base.text
+            },
+            text_size: 12.0,
+        };
+
+        AxisLabel::X(rect, label)
+    }
+
+    fn calc_crosshair_pos(
+        &self, 
+        cursor_pos: Point,
+        region: Rectangle,
+        bounds: Rectangle
+    ) -> Option<(f32, f32)> {
+        let crosshair_ratio = f64::from(cursor_pos.x) / f64::from(self.chart_bounds.width);
+        let chart_x_min = region.x;
+        let chart_x_max = region.x + region.width;
+        let crosshair_pos = chart_x_min + crosshair_ratio as f32 * region.width;
+
+        let snapped_position = (crosshair_pos / self.cell_width).round() * self.cell_width;
+        let snap_ratio = (snapped_position - chart_x_min) / (chart_x_max - chart_x_min);
+        let snap_x = snap_ratio as f64 * f64::from(bounds.width);
+
+        if snap_x.is_nan() || snap_x < 0.0 || snap_x > f64::from(bounds.width) {
+            None
+        } else {
+            Some((snapped_position, snap_x as f32))
+        }
+    }
+
+    fn generate_tick_labels(
+        &self,
+        region: Rectangle,
+        bounds: Rectangle,
+        palette: &Extended,
+        x_labels_can_fit: i32
+    ) -> Vec<AxisLabel> {
+        if self.interval_keys.is_empty() {
+            return Vec::new();
+        }
+        
+        let last_index = self.interval_keys.len() - 1;
+        let step_size = (self.interval_keys.len() as f32 / x_labels_can_fit as f32).ceil() as usize;
+        
+        let min_cell = (region.x / self.cell_width).floor() as i32;
+        let max_cell = ((region.x + region.width) / self.cell_width).ceil() as i32;
+        
+        let max_cell = max_cell.min(0);
+        let min_cell = min_cell.max(-((last_index + 1) as i32));
+        
+        let mut labels = Vec::new();
+        for cell_index in (min_cell..=max_cell).step_by(step_size.max(1)) {
+            let offset = (-cell_index as i64) as usize;
+            if offset > last_index {
+                continue;
+            }
+            
+            let array_index = last_index - offset;
+            let snapped_position = cell_index as f32 * self.cell_width;
+            
+            if let Some(snap_x) = self.calculate_snap_x(snapped_position, region, bounds) {
+                if let Some(timestamp) = self.interval_keys.get(array_index) {
+                    let label_text = self.timezone.format_timestamp(
+                        (*timestamp / 1000) as i64, 
+                        100,
+                    );
+                    
+                    labels.push(self.create_label(
+                        snap_x,
+                        label_text,
+                        bounds,
+                        false,
+                        palette
+                    ));
+                }
+            }
+        }
+        
+        labels
+    }
+    
+    fn generate_time_labels(
+        &self,
+        bounds: Rectangle, 
+        x_min: u64,
+        x_max: u64,
+        palette: &Extended,
+        x_labels_can_fit: i32
+    ) -> Vec<AxisLabel> {
+        let timeframe = match self.basis {
+            ChartBasis::Time(tf) => tf,
+            _ => return Vec::new(),
+        };
+        
+        let (time_step, rounded_earliest) = timeseries::calc_time_step(
+            x_min,
+            x_max,
+            x_labels_can_fit,
+            timeframe,
+        );
+        
+        let mut labels = Vec::new();
+        let mut time = rounded_earliest;
+        
+        while time <= x_max {
+            let x_position = if time >= x_min {
+                ((time - x_min) as f64 / (x_max - x_min) as f64)
+                    * f64::from(bounds.width)
+            } else {
+                0.0
+            };
+            
+            if x_position > 0.0 && x_position <= f64::from(bounds.width) {
+                let text_content = self.timezone.format_timestamp(
+                    (time / 1000) as i64, 
+                    timeframe,
+                );
+                
+                labels.push(self.create_label(
+                    x_position as f32,
+                    text_content,
+                    bounds,
+                    false,
+                    palette
+                ));
+            }
+            time += time_step;
+        }
+        
+        labels
+    }
+    
+    fn generate_tick_crosshair(
+        &self,
+        cursor_pos: Point,
+        region: Rectangle,
+        bounds: Rectangle,
+        palette: &Extended
+    ) -> Option<AxisLabel> {
+        if !self.crosshair {
+            return None;
+        }
+
+        let crosshair_ratio = f64::from(cursor_pos.x) / f64::from(self.chart_bounds.width);
+        let crosshair_pos = region.x + crosshair_ratio as f32 * region.width;
+        let cell_index = (crosshair_pos / self.cell_width).round();
+        
+        let (_, snap_x) = self.calc_crosshair_pos(cursor_pos, region, bounds)?;
+        
+        if snap_x.is_nan() || snap_x < 0.0 || snap_x > bounds.width {
+            return None;
+        }
+        
+        // Cell 0 (latest) maps to last element, Cell -1 to second-to-last, etc.
+        if self.interval_keys.is_empty() {
+            return None;
+        }
+        
+        let last_index = self.interval_keys.len() - 1;
+        let offset = (-cell_index as i64) as usize;
+        if offset > last_index {
+            return None;
+        }
+        
+        let array_index = last_index - offset;
+        let interval = match self.basis {
+            ChartBasis::Tick(interval) => interval,
+            _ => return None,
+        };
+        
+        let aggregation: u64 = interval.into();
+        let rounded_tick = (-cell_index as i64) * (aggregation as i64);
+        
+        if let Some(timestamp) = self.interval_keys.get(array_index) {
+            let label_text = self.timezone
+                .format_crosshair_timestamp(*timestamp as i64, interval);
+            let text_content = format!("{} (#{}.{})", label_text, rounded_tick, interval);
+            
+            return Some(self.create_label(
+                snap_x,
+                text_content,
+                bounds,
+                true,
+                palette
+            ));
+        }
+        
+        None
+    }
+    
+    fn generate_time_crosshair(
+        &self,
+        cursor_pos: Point,
+        bounds: Rectangle,
+        x_min: u64,
+        x_max: u64,
+        palette: &Extended
+    ) -> Option<AxisLabel> {
+        if !self.crosshair {
+            return None;
+        }
+
+        let timeframe = match self.basis {
+            ChartBasis::Time(tf) => tf,
+            _ => return None,
+        };
+
+        let crosshair_ratio = f64::from(cursor_pos.x) / f64::from(bounds.width);
+        let crosshair_millis = x_min as f64
+            + crosshair_ratio * (x_max - x_min) as f64;
+        
+        let crosshair_time = DateTime::from_timestamp_millis(crosshair_millis as i64)?;
+        let rounded_timestamp = (crosshair_time.timestamp_millis() as f64
+            / (timeframe as f64)).round() as u64 * timeframe;
+        
+        let snap_ratio = (rounded_timestamp as f64 - x_min as f64)
+            / (x_max as f64 - x_min as f64);
+        let text_content = self.timezone
+            .format_crosshair_timestamp(rounded_timestamp as i64, timeframe);
+        
+        let snap_x = snap_ratio * f64::from(bounds.width);
+        if snap_x.is_nan() {
+            return None;
+        }
+        
+        Some(self.create_label(
+            snap_x as f32,
+            text_content,
+            bounds,
+            true,
+            palette
+        ))
+    }
+    
+    fn calculate_snap_x(&self, position: f32, region: Rectangle, bounds: Rectangle) -> Option<f32> {
+        let chart_x_min = region.x;
+        let chart_x_max = region.x + region.width;
+        
+        if position < chart_x_min || position > chart_x_max {
+            return None;
+        }
+        
+        let snap_ratio = (position - chart_x_min) / (chart_x_max - chart_x_min);
+        let snap_x = snap_ratio as f64 * f64::from(bounds.width);
+        
+        if snap_x.is_nan() || snap_x < 0.0 || snap_x > f64::from(bounds.width) {
+            None
+        } else {
+            Some(snap_x as f32)
+        }
+    }
+
     fn visible_region(&self, size: Size) -> Rectangle {
         let width = size.width / self.scaling;
         let height = size.height / self.scaling;
@@ -175,14 +456,22 @@ impl AxisLabelsX<'_> {
         }
     }
 
-    fn x_to_time(&self, x: f32) -> u64 {
-        if x <= 0.0 {
-            let diff = (-x / self.cell_width * self.timeframe as f32) as u64;
-            self.max.saturating_sub(diff)
-        } else {
-            let diff = (x / self.cell_width * self.timeframe as f32) as u64;
-            self.max.saturating_add(diff)
-        }
+    fn x_to_interval(&self, x: f32) -> u64 {
+        match self.basis {
+            ChartBasis::Time(interval) => {
+                if x <= 0.0 {
+                    let diff = (-x / self.cell_width * interval as f32) as u64;
+                    self.max.saturating_sub(diff)
+                } else {
+                    let diff = (x / self.cell_width * interval as f32) as u64;
+                    self.max.saturating_add(diff)
+                }
+            },
+            ChartBasis::Tick(_) => {
+                let tick = -(x / self.cell_width);
+                tick.round() as u64
+            }
+        }      
     }
 }
 
@@ -259,125 +548,45 @@ impl canvas::Program<Message> for AxisLabelsX<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let text_size = 12.0;
-
         let palette = theme.extended_palette();
 
         let labels = self.labels_cache.draw(renderer, bounds.size(), |frame| {
             let region = self.visible_region(frame.size());
-
-            let earliest_in_millis = self.x_to_time(region.x);
-            let latest_in_millis = self.x_to_time(region.x + region.width);
-
-            if earliest_in_millis >= latest_in_millis {
-                return;
-            }
-
             let x_labels_can_fit = (bounds.width / 192.0) as i32;
+            let mut all_labels: Vec<AxisLabel> = Vec::with_capacity(x_labels_can_fit as usize + 1);
 
-            let mut all_labels: Vec<AxisLabel> = Vec::with_capacity(x_labels_can_fit as usize + 1); // +1 for crosshair
-
-            // Regular time labels (priority 1)
-            let (time_step, rounded_earliest) = timeseries::calc_time_step(
-                earliest_in_millis,
-                latest_in_millis,
-                x_labels_can_fit,
-                self.timeframe,
-            );
-            let mut time: u64 = rounded_earliest;
-
-            while time <= latest_in_millis {
-                let x_position = if time >= earliest_in_millis {
-                    ((time - earliest_in_millis) as f64 / (latest_in_millis - earliest_in_millis) as f64)
-                        * f64::from(bounds.width)
-                } else {
-                    0.0
-                };
-
-                if x_position > 0.0 && x_position <= f64::from(bounds.width) {
-                    let text_content = self.timezone
-                        .format_timestamp(
-                            (time / 1000) as i64, 
-                            self.timeframe
-                        );
-
-                    let content_width = text_content.len() as f32 * (text_size / 3.0);
-
-                    let rect = Rectangle {
-                        x: (x_position as f32) - content_width,
-                        y: 4.0,
-                        width: 2.0 * content_width,
-                        height: bounds.height - 8.0,
-                    };
-
-                    let label = Label {
-                        content: text_content,
-                        background_color: None,
-                        text_color: palette.background.base.text,
-                        text_size: 12.0,
-                    };
-
-                    all_labels.push(AxisLabel::X(rect, label));
-                }
-                time += time_step;
-            }
-
-            // Crosshair label (priority 2)
-            if self.crosshair {
-                if let Some(crosshair_pos) = cursor.position_in(self.chart_bounds) {
-                    let crosshair_ratio = f64::from(crosshair_pos.x) / f64::from(bounds.width);
-                    let crosshair_millis = earliest_in_millis as f64
-                        + crosshair_ratio * (latest_in_millis - earliest_in_millis) as f64;
-
-                    let (snap_ratio, text_content) = {
-                        if let Some(crosshair_time) =
-                            DateTime::from_timestamp_millis(crosshair_millis as i64)
-                        {
-                            let rounded_timestamp = (crosshair_time.timestamp_millis() as f64
-                                / (self.timeframe as f64)).round() as u64 * self.timeframe;
-
-                            let snap_ratio = (rounded_timestamp as f64 - earliest_in_millis as f64)
-                                / (latest_in_millis as f64 - earliest_in_millis as f64);
-                            
-                            (
-                                snap_ratio, 
-                                self.timezone
-                                    .format_crosshair_timestamp(
-                                        rounded_timestamp as i64, 
-                                        self.timeframe
-                                    ),
-                            )
-                        } else {
-                            (0.0, String::new())
+            let x_min = self.x_to_interval(region.x);
+            let x_max = self.x_to_interval(region.x + region.width);
+        
+            match self.basis {
+                ChartBasis::Tick(_) => {        
+                    all_labels.extend(self.generate_tick_labels(
+                        region, bounds, palette, x_labels_can_fit,
+                    ));
+        
+                    if let Some(cursor_pos) = cursor.position_in(self.chart_bounds) {
+                        if let Some(label) = self.generate_tick_crosshair(
+                            cursor_pos, region, bounds, palette
+                        ) {
+                            all_labels.push(label);
                         }
-                    };
-
-                    let snap_x = snap_ratio * f64::from(bounds.width);
-
-                    if snap_x.is_nan() {
-                        return;
                     }
-
-                    let content_width = text_content.len() as f32 * (text_size / 3.0);
-
-                    let rect = Rectangle {
-                        x: (snap_x as f32) - content_width,
-                        y: 4.0,
-                        width: 2.0 * (content_width),
-                        height: bounds.height - 8.0,
-                    };
-
-                    let label = Label {
-                        content: text_content,
-                        background_color: Some(palette.secondary.base.color),
-                        text_color: palette.secondary.base.text,
-                        text_size: 12.0,
-                    };
-
-                    all_labels.push(AxisLabel::X(rect, label));
+                },
+                ChartBasis::Time(_) => {
+                    all_labels.extend(self.generate_time_labels(
+                        bounds, x_min, x_max, palette, x_labels_can_fit,
+                    ));
+        
+                    if let Some(cursor_pos) = cursor.position_in(self.chart_bounds) {
+                        if let Some(label) = self.generate_time_crosshair(
+                            cursor_pos, bounds, x_min, x_max, palette,
+                        ) {
+                            all_labels.push(label);
+                        }
+                    }
                 }
             }
-
+            
             AxisLabel::filter_and_draw(&all_labels, frame);
         });
 
@@ -410,7 +619,7 @@ pub struct AxisLabelsY<'a> {
     pub tick_size: f32,
     pub decimals: usize,
     pub cell_height: f32,
-    pub timeframe: u32,
+    pub basis: ChartBasis,
     pub chart_bounds: Rectangle,
 }
 
@@ -506,7 +715,6 @@ impl canvas::Program<Message> for AxisLabelsY<'_> {
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let text_size = 12.0;
-
         let palette = theme.extended_palette();
 
         let labels = self.labels_cache.draw(renderer, bounds.size(), |frame| {
@@ -535,35 +743,40 @@ impl canvas::Program<Message> for AxisLabelsY<'_> {
 
             // Last price (priority 2)
             if let Some(label) = self.last_price {
-                let candle_close_label = {
-                    let current_time = chrono::Utc::now().timestamp_millis();
-                    let next_kline_open =
-                        (current_time / i64::from(self.timeframe) + 1) * i64::from(self.timeframe);
-
-                    let remaining_seconds = (next_kline_open - current_time) / 1000;
-                    
-                    if remaining_seconds > 0 {
-                        let hours = remaining_seconds / 3600;
-                        let minutes = (remaining_seconds % 3600) / 60;
-                        let seconds = remaining_seconds % 60;
-
-                        let time_format = if hours > 0 {
-                            format!("{hours:02}:{minutes:02}:{seconds:02}")
-                        } else {
-                            format!("{minutes:02}:{seconds:02}")
-                        };
-
-                        Some(Label {
-                            content: time_format,
-                            background_color: Some(palette.background.strong.color),
-                            text_color: if palette.is_dark {
-                                Color::BLACK.scale_alpha(0.8)
+                let candle_close_label = match self.basis {
+                    ChartBasis::Time(timeframe) => {
+                        let current_time = chrono::Utc::now().timestamp_millis() as u64;
+                        let next_kline_open =
+                            (current_time / timeframe + 1) * timeframe;
+                
+                        let remaining_seconds = (next_kline_open - current_time) / 1000;
+                        
+                        if remaining_seconds > 0 {
+                            let hours = remaining_seconds / 3600;
+                            let minutes = (remaining_seconds % 3600) / 60;
+                            let seconds = remaining_seconds % 60;
+                
+                            let time_format = if hours > 0 {
+                                format!("{hours:02}:{minutes:02}:{seconds:02}")
                             } else {
-                                Color::WHITE.scale_alpha(0.8)
-                            },
-                            text_size: 11.0,
-                        })
-                    } else {
+                                format!("{minutes:02}:{seconds:02}")
+                            };
+                
+                            Some(Label {
+                                content: time_format,
+                                background_color: Some(palette.background.strong.color),
+                                text_color: if palette.is_dark {
+                                    Color::BLACK.scale_alpha(0.8)
+                                } else {
+                                    Color::WHITE.scale_alpha(0.8)
+                                },
+                                text_size: 11.0,
+                            })
+                        } else {
+                            None
+                        }
+                    },
+                    ChartBasis::Tick(_) => {
                         None
                     }
                 };

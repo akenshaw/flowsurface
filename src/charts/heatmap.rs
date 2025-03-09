@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{data_providers::TickerInfo, layout::SerializableChartData, screen::UserTimezone};
 use crate::data_providers::{Depth, Trade};
 
-use super::{indicators::{HeatmapIndicator, Indicator}, scales::PriceInfoLabel};
+use super::{indicators::{HeatmapIndicator, Indicator}, scales::PriceInfoLabel, ChartBasis};
 use super::{Chart, ChartConstants, CommonChartData, Interaction, Message};
 use super::{canvas_interaction, view_chart, update_chart, abbr_large_numbers, count_decimals};
 
@@ -51,13 +51,16 @@ impl Chart for HeatmapChart {
 
     fn get_visible_timerange(&self) -> (u64, u64) {
         let chart = self.get_common_data();
-
         let visible_region = chart.visible_region(chart.bounds.size());
 
         (
-            chart.x_to_time(visible_region.x),
-            chart.x_to_time(visible_region.x + visible_region.width),
+            chart.x_to_interval(visible_region.x),
+            chart.x_to_interval(visible_region.x + visible_region.width),
         )
+    }
+
+    fn get_interval_keys(&self) -> Vec<u64> {
+        self.timeseries.iter().map(|(time, _, _)| *time).collect()
     }
 }
 
@@ -225,7 +228,7 @@ enum IndicatorData {
 
 pub struct HeatmapChart {
     chart: CommonChartData,
-    data_points: Vec<(u64, Box<[GroupedTrade]>, (f32, f32))>,
+    timeseries: Vec<(u64, Box<[GroupedTrade]>, (f32, f32))>,
     indicators: HashMap<HeatmapIndicator, IndicatorData>,
     orderbook: Orderbook,
     visual_config: Config,
@@ -244,32 +247,22 @@ impl HeatmapChart {
             chart: CommonChartData {
                 cell_width: Self::DEFAULT_CELL_WIDTH,
                 cell_height: 4.0,
-                timeframe: aggr_time,
                 tick_size,
                 decimals: count_decimals(tick_size),
                 crosshair: layout.crosshair,
                 indicators_split: layout.indicators_split,
                 ticker_info,
+                basis: ChartBasis::Time(aggr_time),
                 ..Default::default()
             },
             indicators: {
-                let mut indicators = HashMap::new();
-
-                for indicator in enabled_indicators {
-                    indicators.insert(
-                        *indicator,
-                        match indicator {
-                            HeatmapIndicator::Volume => {
-                                IndicatorData::Volume
-                            },
-                        }
-                    );
-                }
-
-                indicators
+                enabled_indicators
+                    .iter()
+                    .map(|&indicator| (indicator, IndicatorData::Volume))
+                    .collect()
             },
             orderbook: Orderbook::new(tick_size, aggr_time),
-            data_points: Vec::new(),
+            timeseries: Vec::new(),
             visual_config: config.unwrap_or_default(),
         }
     }
@@ -277,10 +270,10 @@ impl HeatmapChart {
     pub fn insert_datapoint(&mut self, trades_buffer: &[Trade], depth_update: u64, depth: &Depth) {
         let chart = &mut self.chart;
 
-        if self.data_points.len() > 2400 {
-            self.data_points.drain(0..400);
+        if self.timeseries.len() > 2400 {
+            self.timeseries.drain(0..400);
 
-            if let Some(oldest_time) = self.data_points.first().map(|(time, _, _)| *time) {
+            if let Some(oldest_time) = self.timeseries.first().map(|(time, _, _)| *time) {
                 self.orderbook
                     .price_levels
                     .iter_mut()
@@ -290,7 +283,16 @@ impl HeatmapChart {
             }
         }
 
-        let aggregate_time = chart.timeframe;
+        let aggregate_time: u64 = match chart.basis {
+            ChartBasis::Time(interval) => {
+                interval
+            },
+            ChartBasis::Tick(_) => {
+                // TODO: implement
+                unimplemented!()
+            }
+        };
+
         let rounded_depth_update = (depth_update / aggregate_time) * aggregate_time;
 
         {
@@ -333,7 +335,7 @@ impl HeatmapChart {
                 }
             });
 
-            self.data_points.push((
+            self.timeseries.push((
                 rounded_depth_update,
                 grouped_trades.into_boxed_slice(),
                 (buy_volume, sell_volume),
@@ -383,15 +385,25 @@ impl HeatmapChart {
     pub fn change_tick_size(&mut self, new_tick_size: f32) {
         let chart_state = self.get_common_data_mut();
 
+        let aggregate_time: u64 = match chart_state.basis {
+            ChartBasis::Time(interval) => {
+                interval
+            },
+            ChartBasis::Tick(_) => {
+                // TODO: implement
+                unimplemented!()
+            }
+        };
+
         chart_state.cell_height = 4.0;
         chart_state.tick_size = new_tick_size;
         chart_state.decimals = count_decimals(new_tick_size);
 
-        self.data_points.clear();
-
+        self.timeseries.clear();
+        
         self.orderbook = Orderbook::new(
             new_tick_size, 
-            self.chart.timeframe
+            aggregate_time,
         );
     }
 
@@ -424,7 +436,7 @@ impl HeatmapChart {
         earliest: u64,
         latest: u64,
     ) -> impl Iterator<Item = &(u64, Box<[GroupedTrade]>, (f32, f32))> {
-        self.data_points
+        self.timeseries
             .iter()
             .filter(move |(time, _, _)| *time >= earliest && *time <= latest)
     }
@@ -512,7 +524,7 @@ impl canvas::Program<Message> for HeatmapChart {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        if self.data_points.is_empty() {
+        if self.timeseries.is_empty() {
             return vec![];
         }
 
@@ -537,8 +549,8 @@ impl canvas::Program<Message> for HeatmapChart {
                 let cell_height_scaled = cell_height * chart.scaling;
 
                 let (earliest, latest) = (
-                    chart.x_to_time(region.x),
-                    chart.x_to_time(region.x + region.width),
+                    chart.x_to_interval(region.x),
+                    chart.x_to_interval(region.x + region.width),
                 );
 
                 if latest < earliest {
@@ -564,8 +576,8 @@ impl canvas::Program<Message> for HeatmapChart {
                         runs.iter()
                             .filter(|run| **price * run.qty.0 > self.visual_config.order_size_filter)
                             .for_each(|run| {
-                                let start_x = chart.time_to_x(run.start_time.max(earliest));
-                                let end_x = chart.time_to_x(run.until_time.min(latest)).min(0.0);
+                                let start_x = chart.interval_to_x(run.start_time.max(earliest));
+                                let end_x = chart.interval_to_x(run.until_time.min(latest)).min(0.0);
 
                                 let width = end_x - start_x;
 
@@ -611,7 +623,7 @@ impl canvas::Program<Message> for HeatmapChart {
                             });
                     });
 
-                if let Some((latest_timestamp, _, _)) = self.data_points.last() {
+                if let Some((latest_timestamp, _, _)) = self.timeseries.last() {
                     let max_qty = self
                         .orderbook
                         .latest_order_runs(highest, lowest, *latest_timestamp)
@@ -653,7 +665,7 @@ impl canvas::Program<Message> for HeatmapChart {
 
                 self.visible_data_iter(earliest, latest).for_each(
                     |(time, trades, (buy_volume, sell_volume))| {
-                        let x_position = chart.time_to_x(*time);
+                        let x_position = chart.interval_to_x(*time);
 
                         trades.iter().for_each(|trade| {
                             let y_position = chart.price_to_y(trade.price);
@@ -731,7 +743,7 @@ impl canvas::Program<Message> for HeatmapChart {
             });
         });
 
-        if chart.crosshair & !self.data_points.is_empty() {
+        if chart.crosshair & !self.timeseries.is_empty() {
             let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position);

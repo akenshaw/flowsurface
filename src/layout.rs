@@ -1,3 +1,15 @@
+use crate::charts::{
+    candlestick::CandlestickChart, footprint::FootprintChart, heatmap::HeatmapChart,
+    timeandsales::TimeAndSales,
+    indicators::{CandlestickIndicator, FootprintIndicator, HeatmapIndicator},
+    ChartBasis,
+};
+use crate::data_providers::{Exchange, StreamType, TickMultiplier, Ticker, aggr::time::Timeframe};
+use crate::screen::{UserTimezone, dashboard::{Dashboard, PaneContent, PaneSettings, PaneState}};
+use crate::style::get_icon_text;
+use crate::{screen, style, tooltip};
+use crate::widget::column_drag::{self, DragEvent, DropPosition};
+
 use iced::widget::{button, center, column, container, row, scrollable, text, text_input, Space};
 use regex::Regex;
 use chrono::NaiveDate;
@@ -5,24 +17,11 @@ use serde::{Deserialize, Serialize};
 use iced::widget::pane_grid::{self, Configuration};
 use iced::{padding, Element, Point, Size, Task, Theme};
 use uuid::Uuid;
-
-use crate::charts::candlestick::CandlestickChart;
-use crate::charts::footprint::FootprintChart;
-use crate::charts::heatmap::HeatmapChart;
-use crate::charts::timeandsales::TimeAndSales;
-use crate::charts::indicators::{CandlestickIndicator, FootprintIndicator, HeatmapIndicator};
-use crate::data_providers::{Exchange, StreamType, TickMultiplier, Ticker, Timeframe};
-use crate::screen::{UserTimezone, dashboard::{Dashboard, PaneContent, PaneSettings, PaneState}};
-use crate::style::get_icon_text;
-use crate::{screen, style, tooltip};
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::fs::File;
 use std::path::PathBuf;
 use std::vec;
-
-use crate::widget::column_drag::{self, DragEvent, DropPosition};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableLayout {
@@ -903,13 +902,16 @@ fn configuration(pane: SerializablePane) -> Configuration<PaneState> {
             indicators,
         } => {
             if let Some(ticker_info) = settings.ticker_info {
-                let timeframe = settings.selected_timeframe.unwrap_or(Timeframe::M15);
+                let basis = settings.selected_basis
+                    .unwrap_or(ChartBasis::Time(Timeframe::M15.into()));
+
                 Configuration::Pane(PaneState::from_config(
                     PaneContent::Candlestick(
                         CandlestickChart::new(
                             layout,
+                            basis,
                             vec![],
-                            timeframe,
+                            vec![],
                             ticker_info.min_ticksize,
                             &indicators,
                             settings.ticker_info,
@@ -934,12 +936,14 @@ fn configuration(pane: SerializablePane) -> Configuration<PaneState> {
                 let tick_size = settings.tick_multiply
                     .unwrap_or(TickMultiplier(50))
                     .multiply_with_min_tick_size(ticker_info);
-                let timeframe = settings.selected_timeframe.unwrap_or(Timeframe::M5);
+                let basis = settings.selected_basis
+                    .unwrap_or(ChartBasis::Time(Timeframe::M5.into()));
+                
                 Configuration::Pane(PaneState::from_config(
                     PaneContent::Footprint(
                         FootprintChart::new(
                             layout,
-                            timeframe,
+                            basis,
                             tick_size,
                             vec![],
                             vec![],
