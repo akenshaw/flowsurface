@@ -1,34 +1,58 @@
+use std::collections::HashMap;
+
+use iced::widget::canvas::{self, Cache, Canvas, Event, Frame};
 use iced::{
-    alignment,
+    Element, Length, Point, Rectangle, Size, Task, Theme, Vector, alignment,
     mouse::{self},
-    widget::{button, canvas::{LineDash, Path, Stroke}, center, column, container, row, text, Space},
-    Element, Length, Point, Rectangle, Size, Task, Theme, Vector,
+    widget::{
+        Space, button,
+        canvas::{LineDash, Path, Stroke},
+        column, container, row, text,
+    },
 };
-use iced::widget::canvas::{self, Canvas, Event, Frame, Cache};
 use indicators::Indicator;
+use ordered_float::OrderedFloat;
 use scales::{AxisLabelsX, AxisLabelsY, PriceInfoLabel};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    data_providers::{fetcher::{FetchRange, ReqError, RequestHandler}, TickerInfo}, 
-    layout::SerializableChartData, screen::UserTimezone, style, 
-    tooltip::{self, tooltip}, widget::hsplit::HSplit
+    data_providers::{
+        TickerInfo,
+        aggr::{
+            ticks::TickAggr,
+            time::{TimeSeries, Timeframe},
+        },
+        fetcher::{FetchRange, ReqError, RequestHandler},
+    },
+    layout::SerializableChartData,
+    screen::UserTimezone,
+    style,
+    tooltip::{self, tooltip},
+    widget::hsplit::HSplit,
 };
 
-mod scales;
-pub mod config;
 pub mod candlestick;
+pub mod config;
 pub mod footprint;
 pub mod heatmap;
 pub mod indicators;
+mod scales;
 pub mod timeandsales;
+
+type FootprintTrades = HashMap<OrderedFloat<f32>, (f32, f32)>;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub enum Interaction {
     #[default]
     None,
-    Zoomin { last_position: Point },
-    Panning { translation: Vector, start: Point },
+    Zoomin {
+        last_position: Point,
+    },
+    Panning {
+        translation: Vector,
+        start: Point,
+    },
 }
 
 pub trait ChartConstants {
@@ -70,12 +94,11 @@ trait Chart: ChartConstants + canvas::Program<Message> {
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>>;
 
-    fn view_indicator<I: Indicator>(
-        &self, 
-        enabled: &[I], 
-    ) -> Option<Element<Message>>;
+    fn view_indicator<I: Indicator>(&self, enabled: &[I]) -> Option<Element<Message>>;
 
     fn get_visible_timerange(&self) -> (u64, u64);
+
+    fn get_interval_keys(&self) -> Vec<u64>;
 }
 
 fn canvas_interaction<T: Chart>(
@@ -90,14 +113,12 @@ fn canvas_interaction<T: Chart>(
     }
 
     if chart.get_common_data().bounds != bounds {
-        return Some(canvas::Action::publish(Message::BoundsChanged(
-            bounds,
-        )));
+        return Some(canvas::Action::publish(Message::BoundsChanged(bounds)));
     }
 
     let cursor_position = cursor.position_in(
         // padding for split draggers
-        bounds.shrink(4.0)
+        bounds.shrink(4.0),
     )?;
 
     match event {
@@ -192,10 +213,17 @@ fn canvas_interaction<T: Chart>(
 
                         let translation = {
                             let factor = scaling - old_scaling;
-                            let vector_diff = Vector::new(
-                                cursor_to_center.x * factor / (old_scaling * old_scaling),
-                                cursor_to_center.y * factor / (old_scaling * old_scaling),
-                            );
+                            let denominator = old_scaling * old_scaling;
+
+                            // safeguard against division by very small numbers
+                            let vector_diff = if denominator > 0.0001 {
+                                Vector::new(
+                                    cursor_to_center.x * factor / denominator,
+                                    cursor_to_center.y * factor / denominator,
+                                )
+                            } else {
+                                Vector::new(0.0, 0.0)
+                            };
 
                             chart_state.translation - vector_diff
                         };
@@ -253,23 +281,20 @@ fn update_chart<T: Chart>(chart: &mut T, message: &Message) -> Task<Message> {
 
                 let cursor_chart_x = cursor_to_center_x / old_scaling - old_translation_x;
 
-                let cursor_time = chart_state.x_to_time(cursor_chart_x);
-
+                let cursor_time = chart_state.x_to_interval(cursor_chart_x);
                 chart_state.cell_width = new_width;
+                let new_cursor_x = chart_state.interval_to_x(cursor_time);
 
-                let new_cursor_x = chart_state.time_to_x(cursor_time);
-
-                chart_state.translation.x -= new_cursor_x - cursor_chart_x;
+                if !new_cursor_x.is_nan() && !cursor_chart_x.is_nan() {
+                    chart_state.translation.x -= new_cursor_x - cursor_chart_x;
+                }
 
                 chart_state.autoscale = false;
             }
         }
         Message::YScaling(delta, cursor_to_center_y, is_wheel_scroll) => {
-            let max_scaled_height = chart_state.base_range * T::MAX_CELL_HEIGHT;
-            let min_scaled_height = chart_state.base_range * T::MIN_CELL_HEIGHT;
-
-            if *delta < 0.0 && chart_state.cell_height > min_scaled_height
-                || *delta > 0.0 && chart_state.cell_height < max_scaled_height
+            if *delta < 0.0 && chart_state.cell_height > T::MIN_CELL_HEIGHT
+                || *delta > 0.0 && chart_state.cell_height < T::MAX_CELL_HEIGHT
             {
                 let (old_scaling, old_translation_y) =
                     { (chart_state.scaling, chart_state.translation.y) };
@@ -277,7 +302,7 @@ fn update_chart<T: Chart>(chart: &mut T, message: &Message) -> Task<Message> {
                 let zoom_factor = if *is_wheel_scroll { 30.0 } else { 90.0 };
 
                 let new_height = (chart_state.cell_height * (1.0 + delta / zoom_factor))
-                    .clamp(min_scaled_height, max_scaled_height);
+                    .clamp(T::MIN_CELL_HEIGHT, T::MAX_CELL_HEIGHT);
 
                 let cursor_chart_y = cursor_to_center_y / old_scaling - old_translation_y;
 
@@ -299,9 +324,9 @@ fn update_chart<T: Chart>(chart: &mut T, message: &Message) -> Task<Message> {
             let old_center_x = chart_state.bounds.width / 2.0;
             let new_center_x = bounds.width / 2.0;
             let center_delta_x = (new_center_x - old_center_x) / chart_state.scaling;
-            
+
             chart_state.bounds = *bounds;
-            
+
             if !chart_state.autoscale {
                 chart_state.translation.x += center_delta_x;
             }
@@ -316,19 +341,13 @@ fn update_chart<T: Chart>(chart: &mut T, message: &Message) -> Task<Message> {
 }
 
 fn view_chart<'a, T: Chart, I: Indicator>(
-    chart: &'a T, 
-    indicators: &'a [I], 
+    chart: &'a T,
+    indicators: &'a [I],
     timezone: &'a UserTimezone,
 ) -> Element<'a, Message> {
     let chart_state = chart.get_common_data();
 
-    if chart_state.ticker_info.is_none() {
-        return center(text("Loading...").size(16)).into();
-    }
-
-    let chart_canvas = Canvas::new(chart)
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let chart_canvas = Canvas::new(chart).width(Length::Fill).height(Length::Fill);
 
     let axis_labels_x = Canvas::new(AxisLabelsX {
         labels_cache: &chart_state.cache.x_labels,
@@ -336,10 +355,11 @@ fn view_chart<'a, T: Chart, I: Indicator>(
         translation_x: chart_state.translation.x,
         max: chart_state.latest_x,
         crosshair: chart_state.crosshair,
-        timeframe: chart_state.timeframe,
+        basis: chart_state.basis,
         cell_width: chart_state.cell_width,
         timezone,
         chart_bounds: chart_state.bounds,
+        interval_keys: chart.get_interval_keys(),
     })
     .width(Length::Fill)
     .height(Length::Fill);
@@ -354,7 +374,7 @@ fn view_chart<'a, T: Chart, I: Indicator>(
         crosshair: chart_state.crosshair,
         tick_size: chart_state.tick_size,
         cell_height: chart_state.cell_height,
-        timeframe: chart_state.timeframe as u32,
+        basis: chart_state.basis,
         chart_bounds: chart_state.bounds,
     })
     .width(Length::Fill)
@@ -400,19 +420,12 @@ fn view_chart<'a, T: Chart, I: Indicator>(
     let chart_content = match (chart_state.indicators_split, indicators.is_empty()) {
         (Some(split_at), false) => {
             if let Some(indicator) = chart.view_indicator(indicators) {
-                row![
-                    HSplit::new(
-                        main_chart,
-                        indicator,
-                        Message::SplitDragged,
-                    )
-                    .split(split_at),
-                ]
+                row![HSplit::new(main_chart, indicator, Message::SplitDragged,).split(split_at),]
             } else {
                 main_chart
             }
-        },
-        _ => main_chart
+        }
+        _ => main_chart,
     };
 
     column![
@@ -446,6 +459,67 @@ impl Caches {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ChartBasis {
+    Time(u64),
+    Tick(u64),
+}
+
+impl ChartBasis {
+    pub fn is_time(&self) -> bool {
+        matches!(self, ChartBasis::Time(_))
+    }
+}
+
+impl std::fmt::Display for ChartBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChartBasis::Time(millis) => match *millis {
+                60_000 => write!(f, "1m"),
+                180_000 => write!(f, "3m"),
+                300_000 => write!(f, "5m"),
+                900_000 => write!(f, "15m"),
+                1_800_000 => write!(f, "30m"),
+                3_600_000 => write!(f, "1h"),
+                7_200_000 => write!(f, "2h"),
+                14_400_000 => write!(f, "4h"),
+                _ => write!(f, "{}ms", millis),
+            },
+            ChartBasis::Tick(count) => match *count {
+                _ => write!(f, "T{}", count),
+            },
+        }
+    }
+}
+
+enum ChartData {
+    TimeBased(TimeSeries),
+    TickBased(TickAggr),
+}
+
+impl ChartData {
+    pub fn get_latest_price_range_y_midpoint(&self, chart_state: &CommonChartData) -> f32 {
+        match self {
+            ChartData::TimeBased(timeseries) => timeseries
+                .get_latest_kline()
+                .map(|kline| {
+                    let y_low = chart_state.price_to_y(kline.low);
+                    let y_high = chart_state.price_to_y(kline.high);
+                    -(y_low + y_high) / 2.0
+                })
+                .unwrap_or(0.0),
+            ChartData::TickBased(tick_aggr) => tick_aggr
+                .get_latest_data_point()
+                .map(|dp| {
+                    let y_low = chart_state.price_to_y(dp.low_price);
+                    let y_high = chart_state.price_to_y(dp.high_price);
+                    -(y_low + y_high) / 2.0
+                })
+                .unwrap_or(0.0),
+        }
+    }
+}
+
 pub struct CommonChartData {
     cache: Caches,
 
@@ -458,13 +532,12 @@ pub struct CommonChartData {
     scaling: f32,
     cell_width: f32,
     cell_height: f32,
+    basis: ChartBasis,
 
-    base_range: f32,
     last_price: Option<PriceInfoLabel>,
 
     base_price_y: f32,
     latest_x: u64,
-    timeframe: u64,
     tick_size: f32,
     decimals: usize,
     ticker_info: Option<TickerInfo>,
@@ -479,15 +552,14 @@ impl Default for CommonChartData {
             crosshair: true,
             translation: Vector::default(),
             bounds: Rectangle::default(),
+            basis: ChartBasis::Time(Timeframe::M5.to_milliseconds()),
             last_price: None,
-            base_range: 1.0,
             scaling: 1.0,
             autoscale: true,
             cell_width: 40.0,
             cell_height: 30.0,
             base_price_y: 0.0,
             latest_x: 0,
-            timeframe: 0,
             tick_size: 0.0,
             decimals: 0,
             indicators_split: None,
@@ -509,23 +581,56 @@ impl CommonChartData {
         }
     }
 
-    fn time_to_x(&self, time: u64) -> f32 {
-        if time <= self.latest_x {
-            let diff = self.latest_x - time;
-            -(diff as f32 / self.timeframe as f32) * self.cell_width
-        } else {
-            let diff = time - self.latest_x;
-            (diff as f32 / self.timeframe as f32) * self.cell_width
+    fn get_interval_range(&self, region: Rectangle) -> (u64, u64) {
+        match self.basis {
+            ChartBasis::Tick(_) => (
+                self.x_to_interval(region.x + region.width),
+                self.x_to_interval(region.x),
+            ),
+            ChartBasis::Time(interval) => (
+                self.x_to_interval(region.x) - (interval / 2),
+                self.x_to_interval(region.x + region.width) + (interval / 2),
+            ),
         }
     }
-    
-    fn x_to_time(&self, x: f32) -> u64 {
-        if x <= 0.0 {
-            let diff = (-x / self.cell_width * self.timeframe as f32) as u64;
-            self.latest_x.saturating_sub(diff)
-        } else {
-            let diff = (x / self.cell_width * self.timeframe as f32) as u64;
-            self.latest_x.saturating_add(diff)
+
+    fn get_price_range(&self, region: Rectangle) -> (f32, f32) {
+        let highest = self.y_to_price(region.y);
+        let lowest = self.y_to_price(region.y + region.height);
+
+        (highest, lowest)
+    }
+
+    fn interval_to_x(&self, value: u64) -> f32 {
+        match self.basis {
+            ChartBasis::Time(timeframe) => {
+                if value <= self.latest_x {
+                    let diff = self.latest_x - value;
+                    -(diff as f32 / timeframe as f32) * self.cell_width
+                } else {
+                    let diff = value - self.latest_x;
+                    (diff as f32 / timeframe as f32) * self.cell_width
+                }
+            }
+            ChartBasis::Tick(_) => -((value as f32) * self.cell_width),
+        }
+    }
+
+    fn x_to_interval(&self, x: f32) -> u64 {
+        match self.basis {
+            ChartBasis::Time(interval) => {
+                if x <= 0.0 {
+                    let diff = (-x / self.cell_width * interval as f32) as u64;
+                    self.latest_x.saturating_sub(diff)
+                } else {
+                    let diff = (x / self.cell_width * interval as f32) as u64;
+                    self.latest_x.saturating_add(diff)
+                }
+            }
+            ChartBasis::Tick(_) => {
+                let tick = -(x / self.cell_width);
+                tick.round() as u64
+            }
         }
     }
 
@@ -557,14 +662,11 @@ impl CommonChartData {
                 },
                 ..Default::default()
             },
-            palette.secondary.strong.color
-                .scale_alpha(
-                    if palette.is_dark {
-                        0.6
-                    } else {
-                        1.0
-                    },
-                ),
+            palette
+                .secondary
+                .strong
+                .color
+                .scale_alpha(if palette.is_dark { 0.6 } else { 1.0 }),
         );
 
         // Horizontal price line
@@ -585,62 +687,56 @@ impl CommonChartData {
             dashed_line,
         );
 
-        // Vertical time line
-        let earliest = self.x_to_time(region.x) as f64;
-        let latest = self.x_to_time(region.x + region.width) as f64;
+        // Vertical time/tick line
+        match self.basis {
+            ChartBasis::Time(timeframe) => {
+                let earliest = self.x_to_interval(region.x) as f64;
+                let latest = self.x_to_interval(region.x + region.width) as f64;
 
-        let crosshair_ratio = f64::from(cursor_position.x / bounds.width);
-        let crosshair_millis = earliest + crosshair_ratio * (latest - earliest);
+                let crosshair_ratio = f64::from(cursor_position.x / bounds.width);
+                let crosshair_millis = earliest + crosshair_ratio * (latest - earliest);
 
-        let rounded_timestamp =
-            (crosshair_millis / (self.timeframe as f64)).round() as u64 * self.timeframe;
-        let snap_ratio = ((rounded_timestamp as f64 - earliest) / (latest - earliest)) as f32;
+                let rounded_timestamp =
+                    (crosshair_millis / (timeframe as f64)).round() as u64 * timeframe;
+                let snap_ratio =
+                    ((rounded_timestamp as f64 - earliest) / (latest - earliest)) as f32;
 
-        frame.stroke(
-            &Path::line(
-                Point::new(snap_ratio * bounds.width, 0.0),
-                Point::new(snap_ratio * bounds.width, bounds.height),
-            ),
-            dashed_line,
-        );
+                frame.stroke(
+                    &Path::line(
+                        Point::new(snap_ratio * bounds.width, 0.0),
+                        Point::new(snap_ratio * bounds.width, bounds.height),
+                    ),
+                    dashed_line,
+                );
 
-        // return incase consumer needs them
-        (rounded_price, rounded_timestamp)
-    }
-
-    pub fn check_kline_integrity<T: ContainsKey<u64>>(
-        &self,
-        earliest: u64,
-        latest: u64,
-        data_points: &T
-    ) -> Option<Vec<u64>> {
-        let interval = self.timeframe;
-        
-        let mut time = earliest;
-        let mut missing_count = 0;
-        while time < latest {
-            if !data_points.contains_key(&time) {
-                missing_count += 1;
-                break; 
+                (rounded_price, rounded_timestamp)
             }
-            time += interval;
-        }
-    
-        if missing_count > 0 {
-            let mut missing_keys = Vec::with_capacity(((latest - earliest) / interval) as usize);
-            let mut time = earliest;
-            while time < latest {
-                if !data_points.contains_key(&time) {
-                    missing_keys.push(time);
-                }
-                time += interval;
-            }
-            
-            log::warn!("Integrity check failed: missing {} klines", missing_keys.len());
-            return Some(missing_keys);
-        }
+            ChartBasis::Tick(aggregation) => {
+                let crosshair_ratio = cursor_position.x / bounds.width;
 
-        None
+                let (chart_x_min, chart_x_max) = (region.x, region.x + region.width);
+                let crosshair_pos = chart_x_min + crosshair_ratio * region.width;
+
+                let cell_index = (crosshair_pos / self.cell_width).round();
+
+                let snapped_crosshair = cell_index * self.cell_width;
+
+                let snap_ratio = (snapped_crosshair - chart_x_min) / (chart_x_max - chart_x_min);
+
+                let aggregation: u64 = aggregation.into();
+                let rounded_tick = (-cell_index as u64) * aggregation;
+
+                frame.stroke(
+                    &Path::line(
+                        Point::new(snap_ratio * bounds.width, 0.0),
+                        Point::new(snap_ratio * bounds.width, bounds.height),
+                    ),
+                    dashed_line,
+                );
+
+                (rounded_price, rounded_tick)
+            }
+        }
     }
 
     fn get_chart_layout(&self) -> SerializableChartData {
@@ -651,21 +747,9 @@ impl CommonChartData {
     }
 }
 
-pub trait ContainsKey<K> {
-    fn contains_key(&self, key: &K) -> bool;
-}
-
-impl<K: Ord, V> ContainsKey<K> for std::collections::BTreeMap<K, V> {
-    fn contains_key(&self, key: &K) -> bool {
-        self.contains_key(key)
-    }
-}
-
 fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Task<Message>> {
     match handler.add_request(range) {
-        Ok(req_id) => Some(Task::done(
-            Message::NewDataRange(req_id, range)
-        )),
+        Ok(req_id) => Some(Task::done(Message::NewDataRange(req_id, range))),
         Err(e) => {
             match e {
                 ReqError::Overlaps => log::debug!("Request overlaps with existing request"),

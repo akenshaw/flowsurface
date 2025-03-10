@@ -1,18 +1,25 @@
-use std::{cmp::Ordering, collections::{hash_map::Entry, BTreeMap, HashMap}};
-
-use iced::{
-    mouse, theme::palette::Extended, Alignment, Color, Element, 
-    Point, Rectangle, Renderer, Size, Task, Theme, Vector
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, hash_map::Entry},
 };
+
 use iced::widget::canvas::{self, Event, Geometry, Path};
+use iced::{
+    Alignment, Color, Element, Point, Rectangle, Renderer, Size, Task, Theme, Vector, mouse,
+    theme::palette::Extended,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::{data_providers::TickerInfo, layout::SerializableChartData, screen::UserTimezone};
 use crate::data_providers::{Depth, Trade};
+use crate::{data_providers::TickerInfo, layout::SerializableChartData, screen::UserTimezone};
 
-use super::{indicators::{HeatmapIndicator, Indicator}, scales::PriceInfoLabel};
 use super::{Chart, ChartConstants, CommonChartData, Interaction, Message};
-use super::{canvas_interaction, view_chart, update_chart, abbr_large_numbers, count_decimals};
+use super::{
+    ChartBasis,
+    indicators::{HeatmapIndicator, Indicator},
+    scales::PriceInfoLabel,
+};
+use super::{abbr_large_numbers, canvas_interaction, count_decimals, update_chart, view_chart};
 
 use ordered_float::OrderedFloat;
 
@@ -42,22 +49,23 @@ impl Chart for HeatmapChart {
         canvas_interaction(self, interaction, event, bounds, cursor)
     }
 
-    fn view_indicator<I: Indicator>(
-        &self, 
-        indicators: &[I], 
-    ) -> Option<Element<Message>> {
+    fn view_indicator<I: Indicator>(&self, indicators: &[I]) -> Option<Element<Message>> {
         self.view_indicators(indicators)
     }
 
     fn get_visible_timerange(&self) -> (u64, u64) {
         let chart = self.get_common_data();
-
         let visible_region = chart.visible_region(chart.bounds.size());
 
         (
-            chart.x_to_time(visible_region.x),
-            chart.x_to_time(visible_region.x + visible_region.width),
+            chart.x_to_interval(visible_region.x),
+            chart.x_to_interval(visible_region.x + visible_region.width),
         )
+    }
+
+    fn get_interval_keys(&self) -> Vec<u64> {
+        vec![]
+        //self.timeseries.iter().map(|(time, _, _)| *time).collect()
     }
 }
 
@@ -151,9 +159,7 @@ impl Orderbook {
     }
 
     fn update_price_level(&mut self, time: u64, price: f32, qty: f32, is_bid: bool) {
-        let price_level = self.price_levels
-            .entry(OrderedFloat(price))
-            .or_default();
+        let price_level = self.price_levels.entry(OrderedFloat(price)).or_default();
 
         match price_level.last_mut() {
             Some(last_run) if last_run.qty == OrderedFloat(qty) && last_run.is_bid == is_bid => {
@@ -225,7 +231,7 @@ enum IndicatorData {
 
 pub struct HeatmapChart {
     chart: CommonChartData,
-    data_points: Vec<(u64, Box<[GroupedTrade]>, (f32, f32))>,
+    timeseries: Vec<(u64, Box<[GroupedTrade]>, (f32, f32))>,
     indicators: HashMap<HeatmapIndicator, IndicatorData>,
     orderbook: Orderbook,
     visual_config: Config,
@@ -233,9 +239,9 @@ pub struct HeatmapChart {
 
 impl HeatmapChart {
     pub fn new(
-        layout: SerializableChartData, 
-        tick_size: f32, 
-        aggr_time: u64, 
+        layout: SerializableChartData,
+        tick_size: f32,
+        aggr_time: u64,
         enabled_indicators: &[HeatmapIndicator],
         ticker_info: Option<TickerInfo>,
         config: Option<Config>,
@@ -244,32 +250,22 @@ impl HeatmapChart {
             chart: CommonChartData {
                 cell_width: Self::DEFAULT_CELL_WIDTH,
                 cell_height: 4.0,
-                timeframe: aggr_time,
                 tick_size,
                 decimals: count_decimals(tick_size),
                 crosshair: layout.crosshair,
                 indicators_split: layout.indicators_split,
                 ticker_info,
+                basis: ChartBasis::Time(aggr_time),
                 ..Default::default()
             },
             indicators: {
-                let mut indicators = HashMap::new();
-
-                for indicator in enabled_indicators {
-                    indicators.insert(
-                        *indicator,
-                        match indicator {
-                            HeatmapIndicator::Volume => {
-                                IndicatorData::Volume
-                            },
-                        }
-                    );
-                }
-
-                indicators
+                enabled_indicators
+                    .iter()
+                    .map(|&indicator| (indicator, IndicatorData::Volume))
+                    .collect()
             },
             orderbook: Orderbook::new(tick_size, aggr_time),
-            data_points: Vec::new(),
+            timeseries: Vec::new(),
             visual_config: config.unwrap_or_default(),
         }
     }
@@ -277,10 +273,10 @@ impl HeatmapChart {
     pub fn insert_datapoint(&mut self, trades_buffer: &[Trade], depth_update: u64, depth: &Depth) {
         let chart = &mut self.chart;
 
-        if self.data_points.len() > 2400 {
-            self.data_points.drain(0..400);
+        if self.timeseries.len() > 2400 {
+            self.timeseries.drain(0..400);
 
-            if let Some(oldest_time) = self.data_points.first().map(|(time, _, _)| *time) {
+            if let Some(oldest_time) = self.timeseries.first().map(|(time, _, _)| *time) {
                 self.orderbook
                     .price_levels
                     .iter_mut()
@@ -290,7 +286,14 @@ impl HeatmapChart {
             }
         }
 
-        let aggregate_time = chart.timeframe;
+        let aggregate_time: u64 = match chart.basis {
+            ChartBasis::Time(interval) => interval,
+            ChartBasis::Tick(_) => {
+                // TODO: implement
+                unimplemented!()
+            }
+        };
+
         let rounded_depth_update = (depth_update / aggregate_time) * aggregate_time;
 
         {
@@ -333,7 +336,7 @@ impl HeatmapChart {
                 }
             });
 
-            self.data_points.push((
+            self.timeseries.push((
                 rounded_depth_update,
                 grouped_trades.into_boxed_slice(),
                 (buy_volume, sell_volume),
@@ -345,19 +348,14 @@ impl HeatmapChart {
 
         chart.latest_x = rounded_depth_update;
 
-        let mid_price = match (
-            depth.asks.first_key_value(),
-            depth.bids.last_key_value()
-        ) {
+        let mid_price = match (depth.asks.first_key_value(), depth.bids.last_key_value()) {
             (Some((ask_price, _)), Some((bid_price, _))) => {
                 (ask_price.into_inner() + bid_price.into_inner()) / 2.0
             }
-            _ => chart.base_price_y
+            _ => chart.base_price_y,
         };
 
-        chart.last_price = Some(
-            PriceInfoLabel::Neutral(mid_price)
-        );
+        chart.last_price = Some(PriceInfoLabel::Neutral(mid_price));
 
         if !(chart.translation.x * chart.scaling > chart.bounds.width / 2.0) {
             chart.base_price_y = (mid_price / (chart.tick_size)).round() * (chart.tick_size)
@@ -383,16 +381,21 @@ impl HeatmapChart {
     pub fn change_tick_size(&mut self, new_tick_size: f32) {
         let chart_state = self.get_common_data_mut();
 
+        let aggregate_time: u64 = match chart_state.basis {
+            ChartBasis::Time(interval) => interval,
+            ChartBasis::Tick(_) => {
+                // TODO: implement
+                unimplemented!()
+            }
+        };
+
         chart_state.cell_height = 4.0;
         chart_state.tick_size = new_tick_size;
         chart_state.decimals = count_decimals(new_tick_size);
 
-        self.data_points.clear();
+        self.timeseries.clear();
 
-        self.orderbook = Orderbook::new(
-            new_tick_size, 
-            self.chart.timeframe
-        );
+        self.orderbook = Orderbook::new(new_tick_size, aggregate_time);
     }
 
     pub fn toggle_indicator(&mut self, indicator: HeatmapIndicator) {
@@ -411,7 +414,8 @@ impl HeatmapChart {
 
         if chart_state.autoscale {
             chart_state.translation = Vector::new(
-                0.5 * (chart_state.bounds.width / chart_state.scaling) - (90.0 / chart_state.scaling),
+                0.5 * (chart_state.bounds.width / chart_state.scaling)
+                    - (90.0 / chart_state.scaling),
                 0.0,
             );
         }
@@ -424,7 +428,7 @@ impl HeatmapChart {
         earliest: u64,
         latest: u64,
     ) -> impl Iterator<Item = &(u64, Box<[GroupedTrade]>, (f32, f32))> {
-        self.data_points
+        self.timeseries
             .iter()
             .filter(move |(time, _, _)| *time >= earliest && *time <= latest)
     }
@@ -483,8 +487,8 @@ impl HeatmapChart {
     }
 
     pub fn view<'a, I: Indicator>(
-        &'a self, 
-        indicators: &'a [I], 
+        &'a self,
+        indicators: &'a [I],
         timezone: &'a UserTimezone,
     ) -> Element<'a, Message> {
         view_chart(self, indicators, timezone)
@@ -512,7 +516,7 @@ impl canvas::Program<Message> for HeatmapChart {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        if self.data_points.is_empty() {
+        if self.timeseries.is_empty() {
             return vec![];
         }
 
@@ -522,7 +526,7 @@ impl canvas::Program<Message> for HeatmapChart {
         let bounds_size = bounds.size();
 
         let palette = theme.extended_palette();
-        
+
         let volume_indicator = self.indicators.contains_key(&HeatmapIndicator::Volume);
 
         let heatmap = chart.cache.main.draw(renderer, bounds_size, |frame| {
@@ -533,22 +537,15 @@ impl canvas::Program<Message> for HeatmapChart {
 
                 let region = chart.visible_region(frame.size());
 
-                let cell_height = chart.cell_height;
-                let cell_height_scaled = cell_height * chart.scaling;
-
-                let (earliest, latest) = (
-                    chart.x_to_time(region.x),
-                    chart.x_to_time(region.x + region.width),
-                );
+                let (earliest, latest) = chart.get_interval_range(region);
+                let (highest, lowest) = chart.get_price_range(region);
 
                 if latest < earliest {
                     return;
                 }
 
-                let (highest, lowest) = (
-                    chart.y_to_price(region.y),
-                    chart.y_to_price(region.y + region.height),
-                );
+                let cell_height = chart.cell_height;
+                let cell_height_scaled = cell_height * chart.scaling;
 
                 let qty_scales = self.calc_qty_scales(earliest, latest, highest, lowest);
 
@@ -562,10 +559,13 @@ impl canvas::Program<Message> for HeatmapChart {
                         let y_position = chart.price_to_y(price.0);
 
                         runs.iter()
-                            .filter(|run| **price * run.qty.0 > self.visual_config.order_size_filter)
+                            .filter(|run| {
+                                **price * run.qty.0 > self.visual_config.order_size_filter
+                            })
                             .for_each(|run| {
-                                let start_x = chart.time_to_x(run.start_time.max(earliest));
-                                let end_x = chart.time_to_x(run.until_time.min(latest)).min(0.0);
+                                let start_x = chart.interval_to_x(run.start_time.max(earliest));
+                                let end_x =
+                                    chart.interval_to_x(run.until_time.min(latest)).min(0.0);
 
                                 let width = end_x - start_x;
 
@@ -611,7 +611,7 @@ impl canvas::Program<Message> for HeatmapChart {
                             });
                     });
 
-                if let Some((latest_timestamp, _, _)) = self.data_points.last() {
+                if let Some((latest_timestamp, _, _)) = self.timeseries.last() {
                     let max_qty = self
                         .orderbook
                         .latest_order_runs(highest, lowest, *latest_timestamp)
@@ -653,7 +653,7 @@ impl canvas::Program<Message> for HeatmapChart {
 
                 self.visible_data_iter(earliest, latest).for_each(
                     |(time, trades, (buy_volume, sell_volume))| {
-                        let x_position = chart.time_to_x(*time);
+                        let x_position = chart.interval_to_x(*time);
 
                         trades.iter().for_each(|trade| {
                             let y_position = chart.price_to_y(trade.price);
@@ -670,8 +670,11 @@ impl canvas::Program<Message> for HeatmapChart {
                                         cell_height / 2.0
                                     } else {
                                         // normalize range
-                                        let scale_factor = (self.visual_config.trade_size_scale as f32) / 100.0;
-                                        1.0 + (trade.qty / max_trade_qty) * (28.0 - 1.0) * scale_factor
+                                        let scale_factor =
+                                            (self.visual_config.trade_size_scale as f32) / 100.0;
+                                        1.0 + (trade.qty / max_trade_qty)
+                                            * (28.0 - 1.0)
+                                            * scale_factor
                                     }
                                 };
 
@@ -685,10 +688,12 @@ impl canvas::Program<Message> for HeatmapChart {
                         if volume_indicator {
                             let bar_width = (chart.cell_width / 2.0) * 0.9;
 
-                            let buy_bar_height =
-                                (buy_volume / max_aggr_volume) * (bounds.height / chart.scaling) * 0.1;
-                            let sell_bar_height =
-                                (sell_volume / max_aggr_volume) * (bounds.height / chart.scaling) * 0.1;
+                            let buy_bar_height = (buy_volume / max_aggr_volume)
+                                * (bounds.height / chart.scaling)
+                                * 0.1;
+                            let sell_bar_height = (sell_volume / max_aggr_volume)
+                                * (bounds.height / chart.scaling)
+                                * 0.1;
 
                             frame.fill_rectangle(
                                 Point::new(x_position, (region.y + region.height) - buy_bar_height),
@@ -731,7 +736,7 @@ impl canvas::Program<Message> for HeatmapChart {
             });
         });
 
-        if chart.crosshair & !self.data_points.is_empty() {
+        if chart.crosshair & !self.timeseries.is_empty() {
             let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     chart.draw_crosshair(frame, theme, bounds_size, cursor_position);
