@@ -9,5 +9,6 @@ pub struct Dashboard {
     pub pane: Pane,
     #[serde(deserialize_with = "ok_or_default")]
     pub popout: Vec<(Pane, WindowSpec)>,
+    #[serde(default)]
     pub trade_fetch_enabled: bool,
 }

@@ -1,4 +1,5 @@
 pub mod aggr;
+pub mod audio;
 pub mod chart;
 pub mod config;
 pub mod layout;
@@ -8,6 +9,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+pub use audio::AudioStream;
 pub use config::ScaleFactor;
 pub use config::sidebar::{self, Sidebar};
 pub use config::state::{Layouts, State};
@@ -91,7 +93,7 @@ pub fn get_data_path(path_name: &str) -> PathBuf {
     }
 }
 
-fn cleanup_directory(data_path: PathBuf) -> usize {
+fn cleanup_directory(data_path: &PathBuf) -> usize {
     if !data_path.exists() {
         warn!("Data path {:?} does not exist, skipping cleanup", data_path);
         return 0;
@@ -121,9 +123,8 @@ fn cleanup_directory(data_path: PathBuf) -> usize {
 
         for file in symbol_dir.filter_map(Result::ok) {
             let path = file.path();
-            let filename = match path.to_str() {
-                Some(name) => name,
-                None => continue,
+            let Some(filename) = path.to_str() else {
+                continue;
             };
 
             if let Some(cap) = re.captures(filename) {
@@ -153,10 +154,7 @@ pub fn cleanup_old_market_data() -> usize {
         ))
     });
 
-    let total_deleted: usize = paths
-        .iter()
-        .map(|path| cleanup_directory(path.clone()))
-        .sum();
+    let total_deleted: usize = paths.iter().map(|path| cleanup_directory(&path)).sum();
 
     info!("File cleanup completed. Deleted {} files", total_deleted);
     total_deleted

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio;
 mod charts;
 mod layout;
 mod logger;
@@ -64,6 +65,7 @@ struct Flowsurface {
     sidebar: data::Sidebar,
     theme: data::Theme,
     notifications: Vec<Toast>,
+    audio_stream: audio::AudioStream,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,8 @@ enum Message {
 
     AddNotification(Toast),
     DeleteNotification(usize),
+
+    AudioStream(audio::Message),
 }
 
 impl Flowsurface {
@@ -124,6 +128,7 @@ impl Flowsurface {
                 sidebar: saved_state.sidebar,
                 theme: saved_state.theme,
                 notifications: vec![],
+                audio_stream: audio::AudioStream::new(saved_state.audio_cfg),
             },
             open_main_window
                 .then(|_| Task::none())
@@ -171,7 +176,7 @@ impl Flowsurface {
                             depth,
                             trades_buffer,
                         ) => {
-                            return dashboard
+                            let task = dashboard
                                 .update_depth_and_trades(
                                     &stream,
                                     depth_update_t,
@@ -180,6 +185,14 @@ impl Flowsurface {
                                     main_window_id,
                                 )
                                 .map(move |msg| Message::Dashboard(None, msg));
+
+                            if let Err(err) =
+                                self.audio_stream.try_play_sound(&stream, &trades_buffer)
+                            {
+                                log::error!("Failed to play sound: {err}");
+                            }
+
+                            return task;
                         }
                         exchange::Event::KlineReceived(stream, kline) => {
                             return dashboard
@@ -247,6 +260,8 @@ impl Flowsurface {
                     .find(|(id, _)| **id == self.main_window.id)
                     .map(|(_, spec)| *spec);
 
+                let audio_cfg = data::AudioStream::from(&self.audio_stream);
+
                 let layout = data::State::from_parts(
                     layouts,
                     self.theme.clone(),
@@ -255,6 +270,7 @@ impl Flowsurface {
                     self.timezone,
                     self.sidebar,
                     self.scale_factor,
+                    audio_cfg,
                 );
 
                 match serde_json::to_string(&layout) {
@@ -415,6 +431,14 @@ impl Flowsurface {
             Message::DeleteNotification(index) => {
                 self.notifications.remove(index);
             }
+            Message::AudioStream(message) => {
+                let action = self.audio_stream.update(message);
+
+                match action {
+                    audio::Action::None => {}
+                    audio::Action::Select => {}
+                }
+            }
         }
         Task::none()
     }
@@ -490,9 +514,30 @@ impl Flowsurface {
                         )
                     };
 
+                    let audio_btn = {
+                        let is_active = self.sidebar.is_menu_active(sidebar::Menu::Audio);
+
+                        let icon = match self.audio_stream.get_volume().unwrap_or(0.0) {
+                            v if v >= 40.0 => Icon::SpeakerHigh,
+                            v if v > 0.0 => Icon::SpeakerLow,
+                            _ => Icon::SpeakerOff,
+                        };
+
+                        create_button(
+                            get_icon_text(icon, 14).width(24).align_x(Alignment::Center),
+                            Message::ToggleSidebarMenu(sidebar::Menu::Audio),
+                            None,
+                            tooltip_position,
+                            move |theme, status| {
+                                style::button::transparent(theme, status, is_active)
+                            },
+                        )
+                    };
+
                     column![
                         ticker_search_button,
                         layout_modal_button,
+                        audio_btn,
                         Space::with_height(Length::Fill),
                         settings_modal_button,
                     ]
@@ -760,6 +805,39 @@ impl Flowsurface {
                     dashboard_modal(
                         base,
                         manage_layout_modal,
+                        Message::ToggleSidebarMenu(sidebar::Menu::None),
+                        padding,
+                        Alignment::Start,
+                        align_x,
+                    )
+                }
+                sidebar::Menu::Audio => {
+                    let (align_x, padding) = match sidebar_pos {
+                        sidebar::Position::Left => (Alignment::Start, padding::left(48).top(64)),
+                        sidebar::Position::Right => (Alignment::End, padding::right(48).top(64)),
+                    };
+
+                    let depth_streams_list: Vec<(Exchange, exchange::Ticker)> = dashboard
+                        .pane_streams
+                        .iter()
+                        .flat_map(|(exchange, streams)| {
+                            streams
+                                .iter()
+                                .filter(|(ticker, stream_types)| {
+                                    stream_types.contains(&StreamType::DepthAndTrades {
+                                        exchange: *exchange,
+                                        ticker: **ticker,
+                                    })
+                                })
+                                .map(|(ticker, _)| (*exchange, *ticker))
+                        })
+                        .collect();
+
+                    dashboard_modal(
+                        base,
+                        self.audio_stream
+                            .view(depth_streams_list)
+                            .map(Message::AudioStream),
                         Message::ToggleSidebarMenu(sidebar::Menu::None),
                         padding,
                         Alignment::Start,

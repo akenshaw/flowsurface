@@ -1214,49 +1214,31 @@ impl Dashboard {
         Subscription::batch(market_subscriptions)
     }
 
-    fn get_all_diff_streams(
-        &mut self,
+    pub fn get_all_diff_streams(
+        &self,
         main_window: window::Id,
     ) -> HashMap<Exchange, HashMap<Ticker, HashSet<StreamType>>> {
         let mut pane_streams = HashMap::new();
 
-        self.iter_all_panes_mut(main_window)
-            .for_each(|(_, _, pane_state)| {
-                for stream_type in &pane_state.streams {
-                    match stream_type {
-                        StreamType::Kline {
-                            exchange,
-                            ticker,
-                            timeframe,
-                        } => {
-                            let exchange = *exchange;
-                            let ticker = *ticker;
-                            let timeframe = *timeframe;
+        self.iter_all_panes(main_window)
+            .flat_map(|(_, _, pane_state)| &pane_state.streams)
+            .filter(|stream_type| !matches!(stream_type, StreamType::None))
+            .for_each(|stream_type| {
+                let (exchange, ticker) = match stream_type {
+                    StreamType::Kline {
+                        exchange, ticker, ..
+                    } => (*exchange, *ticker),
+                    StreamType::DepthAndTrades { exchange, ticker } => (*exchange, *ticker),
+                    StreamType::None => unreachable!(),
+                };
 
-                            let exchange_map =
-                                pane_streams.entry(exchange).or_insert(HashMap::new());
-                            let ticker_map = exchange_map.entry(ticker).or_insert(HashSet::new());
-                            ticker_map.insert(StreamType::Kline {
-                                exchange,
-                                ticker,
-                                timeframe,
-                            });
-                        }
-                        StreamType::DepthAndTrades { exchange, ticker } => {
-                            let exchange = *exchange;
-                            let ticker = *ticker;
-
-                            let exchange_map =
-                                pane_streams.entry(exchange).or_insert(HashMap::new());
-                            let ticker_map = exchange_map.entry(ticker).or_insert(HashSet::new());
-                            ticker_map.insert(StreamType::DepthAndTrades { exchange, ticker });
-                        }
-                        StreamType::None => {}
-                    }
-                }
+                pane_streams
+                    .entry(exchange)
+                    .or_insert_with(HashMap::new)
+                    .entry(ticker)
+                    .or_insert_with(HashSet::new)
+                    .insert(*stream_type);
             });
-
-        self.pane_streams.clone_from(&pane_streams);
 
         pane_streams
     }

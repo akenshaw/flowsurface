@@ -485,6 +485,7 @@ pub struct SavedState {
     pub timezone: data::UserTimezone,
     pub sidebar: data::Sidebar,
     pub theme: data::Theme,
+    pub audio_cfg: data::AudioStream,
 }
 
 impl Default for SavedState {
@@ -497,6 +498,7 @@ impl Default for SavedState {
             timezone: UserTimezone::default(),
             sidebar: data::Sidebar::default(),
             theme: data::Theme::default(),
+            audio_cfg: data::AudioStream::default(),
         }
     }
 }
@@ -777,6 +779,7 @@ pub fn load_saved_state() -> SavedState {
                 timezone: state.timezone,
                 sidebar: state.sidebar,
                 scale_factor: state.scale_factor,
+                audio_cfg: state.audio_cfg,
             }
         }
         Err(e) => {
