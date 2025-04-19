@@ -18,6 +18,36 @@ use iced::{
     Background, Border, Element, Length, Padding, Pixels, Point, Rectangle, Size, Theme, Vector,
 };
 
+pub fn reorder_vec<T>(vec: &mut Vec<T>, event: DragEvent) {
+    if let DragEvent::Dropped {
+        index,
+        target_index,
+        drop_position,
+    } = event
+    {
+        if vec.len() > 1 {
+            match drop_position {
+                DropPosition::Before | DropPosition::After => {
+                    if target_index != index && target_index != index + 1 {
+                        let item = vec.remove(index);
+                        let insert_index = if index < target_index {
+                            target_index - 1
+                        } else {
+                            target_index
+                        };
+                        vec.insert(insert_index, item);
+                    }
+                }
+                DropPosition::Swap => {
+                    if target_index != index && target_index < vec.len() {
+                        vec.swap(index, target_index);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Idle,
@@ -411,8 +441,17 @@ where
                     }
                     Action::Dragging { origin, index, .. } => {
                         if let Some(cursor_position) = cursor.position() {
+                            let bounds = layout.bounds();
+                            // clamp y so the ghost never goes outside the column
+                            let clamped_y =
+                                cursor_position.y.clamp(bounds.y, bounds.y + bounds.height);
+                            let clamped_cursor = Point {
+                                x: cursor_position.x,
+                                y: clamped_y,
+                            };
+
                             *action = Action::Dragging {
-                                last_cursor: cursor_position,
+                                last_cursor: clamped_cursor,
                                 origin,
                                 index,
                             };

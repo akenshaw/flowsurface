@@ -6,7 +6,7 @@ use crate::{
     },
     screen::{DashboardError, create_button},
     style::{self, Icon, get_icon_text},
-    widget::{self, notification::Toast, pane_modal},
+    widget::{self, column_drag, notification::Toast, pane_modal},
     window::{self, Window},
 };
 use data::{
@@ -82,6 +82,7 @@ pub enum Message {
     Popout,
     Merge,
     DeleteNotification(pane_grid::Pane, usize),
+    ReorderIndicator(pane_grid::Pane, column_drag::DragEvent),
 }
 
 pub struct PaneState {
@@ -250,7 +251,7 @@ impl PaneState {
                 };
                 let layout = existing_layout.unwrap_or(ChartLayout {
                     crosshair: true,
-                    indicators_split: None,
+                    splits: vec![],
                 });
 
                 let basis = self.settings.selected_basis.unwrap_or(Basis::Time(100));
@@ -282,9 +283,21 @@ impl PaneState {
                     _ => vec![FootprintIndicator::Volume, FootprintIndicator::OpenInterest],
                 };
 
+                let splits = {
+                    let main_chart_split: f32 = 0.7;
+                    let mut splits = vec![main_chart_split];
+
+                    if !enabled_indicators.is_empty() {
+                        let indicator_split = main_chart_split
+                            + (1.0 - main_chart_split) / (enabled_indicators.len()) as f32;
+                        splits.extend(vec![indicator_split; enabled_indicators.len() - 1]);
+                    }
+                    splits
+                };
+
                 let layout = existing_layout.unwrap_or(ChartLayout {
                     crosshair: true,
-                    indicators_split: Some(0.8),
+                    splits,
                 });
 
                 PaneContent::Footprint(
@@ -316,9 +329,21 @@ impl PaneState {
                     ],
                 };
 
+                let splits = {
+                    let main_chart_split: f32 = 0.7;
+                    let mut splits = vec![main_chart_split];
+
+                    if !enabled_indicators.is_empty() {
+                        let indicator_split = main_chart_split
+                            + (1.0 - main_chart_split) / (enabled_indicators.len()) as f32;
+                        splits.extend(vec![indicator_split; enabled_indicators.len() - 1]);
+                    }
+                    splits
+                };
+
                 let layout = existing_layout.unwrap_or(ChartLayout {
                     crosshair: true,
-                    indicators_split: Some(0.8),
+                    splits,
                 });
 
                 PaneContent::Candlestick(
@@ -872,26 +897,41 @@ fn indicators_view<I: Indicator>(
     market_type: Option<MarketType>,
     selected: &[I],
 ) -> Element<Message> {
-    let mut content_row =
-        column![container(text("Indicators").size(14)).padding(padding::bottom(8)),].spacing(4);
+    let mut indicators_column = column_drag::Column::new()
+        .on_drag(move |event| Message::ReorderIndicator(pane, event))
+        .spacing(4);
 
-    for indicator in I::get_available(market_type) {
-        content_row = content_row.push(if selected.contains(indicator) {
-            button(row![
-                text(indicator.to_string()),
-                horizontal_space(),
-                container(get_icon_text(Icon::Checkmark, 12)),
-            ])
-            .on_press(Message::ToggleIndicator(pane, indicator.to_string()))
-            .width(Length::Fill)
-            .style(move |theme, status| style::button::modifier(theme, status, true))
-        } else {
-            button(text(indicator.to_string()))
+    if let Some(market) = market_type {
+        for indicator in selected {
+            indicators_column = indicators_column.push(
+                button(row![
+                    text(indicator.to_string()),
+                    horizontal_space(),
+                    container(get_icon_text(Icon::Checkmark, 12)),
+                ])
                 .on_press(Message::ToggleIndicator(pane, indicator.to_string()))
                 .width(Length::Fill)
-                .style(move |theme, status| style::button::modifier(theme, status, false))
-        });
+                .style(move |theme, status| style::button::modifier(theme, status, true)),
+            );
+        }
+
+        for indicator in I::get_available(market) {
+            if !selected.contains(indicator) {
+                indicators_column = indicators_column.push(
+                    button(text(indicator.to_string()))
+                        .on_press(Message::ToggleIndicator(pane, indicator.to_string()))
+                        .width(Length::Fill)
+                        .style(move |theme, status| style::button::modifier(theme, status, false)),
+                );
+            }
+        }
     }
+
+    let content_row = column![
+        container(text("Indicators").size(14)).padding(padding::bottom(8)),
+        indicators_column
+    ]
+    .spacing(4);
 
     container(content_row)
         .max_width(200)
@@ -1136,6 +1176,17 @@ impl PaneContent {
         }
     }
 
+    pub fn reorder_indicators(&mut self, event: column_drag::DragEvent) {
+        match self {
+            PaneContent::Heatmap(_, indicator) => column_drag::reorder_vec(indicator, event),
+            PaneContent::Footprint(_, indicator) => column_drag::reorder_vec(indicator, event),
+            PaneContent::Candlestick(_, indicator) => column_drag::reorder_vec(indicator, event),
+            PaneContent::TimeAndSales(_) | PaneContent::Starter => {
+                panic!("indicator reorder on {} pane", self)
+            }
+        }
+    }
+
     pub fn change_visual_config(&mut self, config: VisualConfig) {
         match (self, config) {
             (PaneContent::Heatmap(chart, _), VisualConfig::Heatmap(cfg)) => {
@@ -1145,6 +1196,18 @@ impl PaneContent {
                 panel.set_config(cfg);
             }
             _ => {}
+        }
+    }
+}
+
+impl std::fmt::Display for PaneContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaneContent::Starter => write!(f, "Starter pane"),
+            PaneContent::Heatmap(_, _) => write!(f, "Heatmap chart"),
+            PaneContent::Footprint(_, _) => write!(f, "Footprint chart"),
+            PaneContent::Candlestick(_, _) => write!(f, "Candlestick chart"),
+            PaneContent::TimeAndSales(_) => write!(f, "Time&Sales pane"),
         }
     }
 }
