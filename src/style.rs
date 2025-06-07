@@ -247,6 +247,38 @@ pub mod button {
         }
     }
 
+    pub fn menu_body(theme: &Theme, status: Status, is_selected: bool) -> Style {
+        let palette = theme.extended_palette();
+
+        Style {
+            text_color: palette.background.base.text,
+            border: Border {
+                radius: 3.0.into(),
+                width: if is_selected { 2.0 } else { 0.0 },
+                color: palette.background.strong.color,
+            },
+            background: match status {
+                Status::Active => {
+                    if is_selected {
+                        Some(palette.background.base.color.into())
+                    } else {
+                        Some(palette.background.weakest.color.into())
+                    }
+                }
+                Status::Pressed => Some(palette.background.strongest.color.into()),
+                Status::Hovered => Some(palette.background.strong.color.into()),
+                Status::Disabled => {
+                    if is_selected {
+                        None
+                    } else {
+                        Some(palette.secondary.base.color.into())
+                    }
+                }
+            },
+            ..Default::default()
+        }
+    }
+
     pub fn ticker_card(theme: &Theme, status: Status) -> Style {
         let palette = theme.extended_palette();
 
@@ -467,9 +499,10 @@ pub fn ts_table_container(theme: &Theme, is_sell: bool, color_alpha: f32) -> Sty
 }
 
 // Tickers Table
-pub fn search_input(
+pub fn validated_text_input(
     theme: &Theme,
     status: widget::text_input::Status,
+    is_valid: bool,
 ) -> widget::text_input::Style {
     let palette = theme.extended_palette();
 
@@ -497,11 +530,15 @@ pub fn search_input(
         border: Border {
             radius: 3.0.into(),
             width: 1.0,
-            color: border_color,
+            color: if is_valid {
+                border_color
+            } else {
+                palette.danger.base.color
+            },
         },
         icon: palette.background.strong.text,
         placeholder,
-        value: palette.background.weak.text,
+        value: palette.background.base.text,
         selection: palette.background.strongest.color,
     }
 }

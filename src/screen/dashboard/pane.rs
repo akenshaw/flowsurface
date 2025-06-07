@@ -1,9 +1,11 @@
 use crate::{
     chart::{self, heatmap::HeatmapChart, kline::KlineChart},
     modal::{
-        self, StreamModifier,
-        pane::settings::{heatmap_cfg_view, kline_cfg_view},
-        pane::stack,
+        self, ModifierKind,
+        pane::{
+            settings::{heatmap_cfg_view, kline_cfg_view},
+            stack_modal,
+        },
     },
     screen::{DashboardError, dashboard::panel::timeandsales::TimeAndSales},
     style::{self, Icon, icon_text},
@@ -48,7 +50,7 @@ pub enum Status {
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub enum Modal {
-    StreamModifier,
+    StreamModifier(modal::stream::Modifier),
     Settings,
     Indicators,
 }
@@ -62,9 +64,8 @@ pub enum Message {
     SplitPane(pane_grid::Axis, pane_grid::Pane),
     MaximizePane(pane_grid::Pane),
     Restore,
-    TicksizeSelected(TickMultiplier, pane_grid::Pane),
-    BasisSelected(Basis, pane_grid::Pane),
-    ToggleModal(pane_grid::Pane, Modal),
+    ShowModal(pane_grid::Pane, Modal),
+    HideModal(pane_grid::Pane),
     InitPaneContent(String, Option<pane_grid::Pane>, Vec<StreamKind>, TickerInfo),
     ReplacePane(pane_grid::Pane),
     ChartUserUpdate(pane_grid::Pane, chart::Message),
@@ -75,10 +76,8 @@ pub enum Message {
     DeleteNotification(pane_grid::Pane, usize),
     ReorderIndicator(pane_grid::Pane, column_drag::DragEvent),
     ClusterKindSelected(pane_grid::Pane, data::chart::kline::ClusterKind),
-    StudyConfigurator(
-        pane_grid::Pane,
-        crate::modal::pane::settings::study::Message,
-    ),
+    StreamModifierChanged(pane_grid::Pane, modal::stream::Message),
+    StudyConfigurator(pane_grid::Pane, modal::pane::settings::study::Message),
 }
 
 pub struct State {
@@ -341,57 +340,84 @@ impl State {
             );
         }
 
-        let is_stream_modifier = self
-            .modal
-            .is_some_and(|m| matches!(m, Modal::StreamModifier));
-
-        match &self.content {
-            Content::Starter | Content::TimeAndSales(_) => {}
-            Content::Heatmap(_, _) => {
-                stream_info_element = stream_info_element.push(
-                    button(text(format!(
-                        "{} - {}",
-                        self.settings
-                            .selected_basis
-                            .unwrap_or(Basis::default_heatmap_time(self.settings.ticker_info)),
-                        self.settings.tick_multiply.unwrap_or(TickMultiplier(5)),
-                    )))
-                    .style(move |theme, status| {
-                        style::button::modifier(theme, status, !is_stream_modifier)
-                    })
-                    .on_press(Message::ToggleModal(id, Modal::StreamModifier)),
-                );
+        let modifier: Option<modal::stream::Modifier> = self.modal.and_then(|m| {
+            if let Modal::StreamModifier(modifier) = m {
+                Some(modifier)
+            } else {
+                None
             }
-            Content::Kline(chart, _) => match chart.kind() {
-                data::chart::KlineChartKind::Footprint { .. } => {
-                    stream_info_element = stream_info_element.push(
-                        button(text(format!(
-                            "{} - {}",
-                            self.settings.selected_basis.unwrap_or(Timeframe::M5.into()),
-                            self.settings.tick_multiply.unwrap_or(TickMultiplier(10)),
-                        )))
-                        .style(move |theme, status| {
-                            style::button::modifier(theme, status, !is_stream_modifier)
-                        })
-                        .on_press(Message::ToggleModal(id, Modal::StreamModifier)),
-                    );
+        });
+
+        let body = match &self.content {
+            Content::Starter => center(text("select a ticker to start").size(16)).into(),
+            Content::TimeAndSales(panel) => super::panel::view(id, self, panel, timezone),
+            Content::Heatmap(chart, indicators) => {
+                let selected_basis = self
+                    .settings
+                    .selected_basis
+                    .unwrap_or(Basis::default_heatmap_time(self.settings.ticker_info));
+                let tick_multiply = self.settings.tick_multiply.unwrap_or(TickMultiplier(5));
+                let kind = ModifierKind::Heatmap(selected_basis, tick_multiply);
+
+                let base_ticksize = data::util::base_ticksize(chart.tick_size(), tick_multiply);
+
+                let modifiers = row![
+                    basis_modifier(id, selected_basis, modifier, kind),
+                    ticksize_modifier(id, base_ticksize, tick_multiply, modifier, kind),
+                ]
+                .spacing(4);
+
+                stream_info_element = stream_info_element.push(modifiers);
+
+                let base = chart::view(chart, indicators, timezone)
+                    .map(move |message| Message::ChartUserUpdate(id, message));
+                let settings_modal = || heatmap_cfg_view(chart.visual_config(), id);
+
+                self.compose_chart_view(base, id, indicators, settings_modal)
+            }
+            Content::Kline(chart, indicators) => {
+                let chart_kind = chart.kind();
+
+                match chart_kind {
+                    data::chart::KlineChartKind::Footprint { .. } => {
+                        let selected_basis =
+                            self.settings.selected_basis.unwrap_or(Timeframe::M5.into());
+                        let tick_multiply =
+                            self.settings.tick_multiply.unwrap_or(TickMultiplier(10));
+                        let kind = ModifierKind::Footprint(selected_basis, tick_multiply);
+
+                        let base_ticksize =
+                            data::util::base_ticksize(chart.tick_size(), tick_multiply);
+
+                        let modifiers = row![
+                            basis_modifier(id, selected_basis, modifier, kind),
+                            ticksize_modifier(id, base_ticksize, tick_multiply, modifier, kind),
+                        ]
+                        .spacing(4);
+
+                        stream_info_element = stream_info_element.push(modifiers);
+                    }
+                    data::chart::KlineChartKind::Candles => {
+                        let selected_basis = self
+                            .settings
+                            .selected_basis
+                            .unwrap_or(Timeframe::M15.into());
+                        let kind = ModifierKind::Candlestick(selected_basis);
+
+                        let modifiers =
+                            row![basis_modifier(id, selected_basis, modifier, kind),].spacing(4);
+
+                        stream_info_element = stream_info_element.push(modifiers);
+                    }
                 }
-                data::chart::KlineChartKind::Candles => {
-                    stream_info_element = stream_info_element.push(
-                        button(text(
-                            self.settings
-                                .selected_basis
-                                .unwrap_or(Timeframe::M15.into())
-                                .to_string(),
-                        ))
-                        .style(move |theme, status| {
-                            style::button::modifier(theme, status, !is_stream_modifier)
-                        })
-                        .on_press(Message::ToggleModal(id, Modal::StreamModifier)),
-                    );
-                }
-            },
-        }
+
+                let base = chart::view(chart, indicators, timezone)
+                    .map(move |message| Message::ChartUserUpdate(id, message));
+                let settings_modal = || kline_cfg_view(chart.study_configurator(), chart_kind, id);
+
+                self.compose_chart_view(base, id, indicators, settings_modal)
+            }
+        };
 
         match &self.status {
             Status::Loading(InfoType::FetchingKlines) => {
@@ -410,7 +436,7 @@ impl State {
             Status::Ready => {}
         }
 
-        let content = pane_grid::Content::new(self.content.view(id, self, timezone))
+        let content = pane_grid::Content::new(body)
             .style(move |theme| style::pane_background(theme, is_focused));
 
         let title_bar = pane_grid::TitleBar::new(stream_info_element)
@@ -450,7 +476,7 @@ impl State {
         if !matches!(&self.content, Content::Starter) {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::Cog, 12),
-                Message::ToggleModal(pane, Modal::Settings),
+                Message::ShowModal(pane, Modal::Settings),
                 None,
                 tooltip_pos,
                 modal_btn_style(Modal::Settings),
@@ -460,7 +486,7 @@ impl State {
         if matches!(&self.content, Content::Heatmap(_, _) | Content::Kline(_, _)) {
             buttons = buttons.push(button_with_tooltip(
                 icon_text(Icon::ChartOutline, 12),
-                Message::ToggleModal(pane, Modal::Indicators),
+                Message::ShowModal(pane, Modal::Indicators),
                 Some("Indicators"),
                 tooltip_pos,
                 modal_btn_style(Modal::Indicators),
@@ -514,6 +540,52 @@ impl State {
             .align_y(Vertical::Center)
             .height(Length::Fixed(32.0))
             .into()
+    }
+
+    fn compose_chart_view<'a, F>(
+        &'a self,
+        base: Element<'a, Message>,
+        pane: pane_grid::Pane,
+        indicators: &'a [impl Indicator],
+        settings_modal: F,
+    ) -> Element<'a, Message>
+    where
+        F: FnOnce() -> Element<'a, Message>,
+    {
+        let base =
+            widget::toast::Manager::new(base, &self.notifications, Alignment::End, move |msg| {
+                Message::DeleteNotification(pane, msg)
+            })
+            .into();
+
+        let stack_padding = padding::right(12).left(12);
+
+        match self.modal {
+            Some(Modal::StreamModifier(modifier)) => stack_modal(
+                base,
+                modifier
+                    .view(self.stream_pair())
+                    .map(move |message| Message::StreamModifierChanged(pane, message)),
+                Message::HideModal(pane),
+                stack_padding,
+                Alignment::Start,
+            ),
+            Some(Modal::Indicators) => stack_modal(
+                base,
+                modal::indicators::view(pane, self, indicators),
+                Message::HideModal(pane),
+                stack_padding,
+                Alignment::End,
+            ),
+            Some(Modal::Settings) => stack_modal(
+                base,
+                settings_modal(),
+                Message::HideModal(pane),
+                stack_padding,
+                Alignment::End,
+            ),
+            None => base,
+        }
     }
 
     pub fn matches_stream(&self, stream: &StreamKind) -> bool {
@@ -805,74 +877,6 @@ impl Content {
             _ => {}
         }
     }
-
-    pub fn view<'a>(
-        &'a self,
-        pane: pane_grid::Pane,
-        state: &'a State,
-        timezone: UserTimezone,
-    ) -> Element<'a, Message> {
-        match self {
-            Content::Starter => center(text("select a ticker to start").size(16)).into(),
-            Content::TimeAndSales(panel) => super::panel::view(pane, state, panel, timezone),
-            Content::Heatmap(chart, indicators) => {
-                let base = chart::view(chart, indicators, timezone)
-                    .map(move |message| Message::ChartUserUpdate(pane, message));
-
-                let settings_view = || heatmap_cfg_view(chart.visual_config(), pane);
-
-                let stream_modifier = StreamModifier::Heatmap(
-                    state
-                        .settings
-                        .selected_basis
-                        .unwrap_or(Basis::default_heatmap_time(state.settings.ticker_info)),
-                    state.settings.tick_multiply.unwrap_or(TickMultiplier(5)),
-                );
-
-                compose_chart_view(
-                    base,
-                    state,
-                    pane,
-                    indicators,
-                    settings_view,
-                    stream_modifier,
-                )
-            }
-            Content::Kline(chart, indicators) => {
-                let base = chart::view(chart, indicators, timezone)
-                    .map(move |message| Message::ChartUserUpdate(pane, message));
-
-                let chart_kind = chart.kind();
-
-                let settings_view = || kline_cfg_view(chart.study_configurator(), chart_kind, pane);
-
-                let stream_modifier = match chart_kind {
-                    data::chart::KlineChartKind::Footprint { .. } => StreamModifier::Footprint(
-                        state
-                            .settings
-                            .selected_basis
-                            .unwrap_or(Timeframe::M5.into()),
-                        state.settings.tick_multiply.unwrap_or(TickMultiplier(50)),
-                    ),
-                    data::chart::KlineChartKind::Candles => StreamModifier::Candlestick(
-                        state
-                            .settings
-                            .selected_basis
-                            .unwrap_or(Timeframe::M15.into()),
-                    ),
-                };
-
-                compose_chart_view(
-                    base,
-                    state,
-                    pane,
-                    indicators,
-                    settings_view,
-                    stream_modifier,
-                )
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for Content {
@@ -889,45 +893,45 @@ impl std::fmt::Display for Content {
     }
 }
 
-fn compose_chart_view<'a, F>(
-    base: Element<'a, Message>,
-    state: &'a State,
-    pane: pane_grid::Pane,
-    indicators: &'a [impl Indicator],
-    settings_view: F,
-    stream_modifier: StreamModifier,
-) -> Element<'a, Message>
-where
-    F: FnOnce() -> Element<'a, Message>,
-{
-    let base =
-        widget::toast::Manager::new(base, &state.notifications, Alignment::End, move |msg| {
-            Message::DeleteNotification(pane, msg)
-        })
-        .into();
+fn ticksize_modifier<'a>(
+    id: pane_grid::Pane,
+    base_ticksize: f32,
+    multiplier: TickMultiplier,
+    modifier: Option<modal::stream::Modifier>,
+    kind: ModifierKind,
+) -> Element<'a, Message> {
+    let modifier_modal = Modal::StreamModifier(
+        modal::stream::Modifier::new(kind).with_ticksize_view(base_ticksize, multiplier),
+    );
 
-    match state.modal {
-        Some(Modal::StreamModifier) => stack(
-            base,
-            modal::stream::view(pane, stream_modifier, state.stream_pair()),
-            Message::ToggleModal(pane, Modal::StreamModifier),
-            padding::left(36),
-            Alignment::Start,
-        ),
-        Some(Modal::Indicators) => stack(
-            base,
-            modal::indicators::view(pane, state, indicators),
-            Message::ToggleModal(pane, Modal::Indicators),
-            padding::right(12).left(12),
-            Alignment::End,
-        ),
-        Some(Modal::Settings) => stack(
-            base,
-            settings_view(),
-            Message::ToggleModal(pane, Modal::Settings),
-            padding::right(12).left(12),
-            Alignment::End,
-        ),
-        None => base,
-    }
+    let is_active = modifier.is_some_and(|m| {
+        matches!(
+            m.view_mode,
+            modal::stream::ViewMode::TicksizeSelection { .. }
+        )
+    });
+
+    button(text(multiplier.to_string()))
+        .style(move |theme, status| style::button::modifier(theme, status, !is_active))
+        .on_press(Message::ShowModal(id, modifier_modal))
+        .into()
+}
+
+fn basis_modifier<'a>(
+    id: pane_grid::Pane,
+    selected_basis: Basis,
+    modifier: Option<modal::stream::Modifier>,
+    kind: ModifierKind,
+) -> Element<'a, Message> {
+    let modifier_modal = Modal::StreamModifier(
+        modal::stream::Modifier::new(kind).with_view_mode(modal::stream::ViewMode::BasisSelection),
+    );
+
+    let is_active =
+        modifier.is_some_and(|m| m.view_mode == modal::stream::ViewMode::BasisSelection);
+
+    button(text(selected_basis.to_string()))
+        .style(move |theme, status| style::button::modifier(theme, status, !is_active))
+        .on_press(Message::ShowModal(id, modifier_modal))
+        .into()
 }

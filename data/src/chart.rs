@@ -8,6 +8,8 @@ pub mod timeandsales;
 
 pub use kline::KlineChartKind;
 
+use crate::aggr;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChartLayout {
     pub crosshair: bool,
@@ -52,9 +54,8 @@ pub enum Basis {
 
     /// Trade-based aggregation where each datapoint represents a fixed number of trades.
     ///
-    /// The u64 value represents the number of trades per aggregation unit.
-    /// Common values include 100, 500, or 1000 trades per bar/candle.
-    Tick(u64),
+    /// The u16 value represents the number of trades per aggregation unit.
+    Tick(aggr::TickCount),
 }
 
 impl Basis {
@@ -79,7 +80,7 @@ impl std::fmt::Display for Basis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Basis::Time(timeframe) => write!(f, "{timeframe}"),
-            Basis::Tick(count) => write!(f, "{count}T"),
+            Basis::Tick(count) => write!(f, "{count}"),
         }
     }
 }
