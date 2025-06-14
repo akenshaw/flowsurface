@@ -1179,7 +1179,7 @@ impl Dashboard {
                             chart.insert_datapoint(trades_buffer, depth_update_t, depth);
                         }
                         pane::Content::Kline(chart, _) => {
-                            chart.insert_trades_buffer(trades_buffer, depth_update_t);
+                            chart.insert_trades_buffer(trades_buffer);
                         }
                         pane::Content::TimeAndSales(panel) => {
                             panel.insert_buffer(trades_buffer);

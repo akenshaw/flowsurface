@@ -7,8 +7,50 @@ use serde::{Deserialize, Serialize};
 use crate::util::round_to_tick;
 
 #[derive(Debug, Clone, Default)]
+pub struct GroupedTrades {
+    pub buy_qty: f32,
+    pub sell_qty: f32,
+    pub first_time: u64,
+    pub last_time: u64,
+    pub buy_count: usize,
+    pub sell_count: usize,
+}
+
+impl GroupedTrades {
+    fn new(trade: &Trade) -> Self {
+        Self {
+            buy_qty: if trade.is_sell { 0.0 } else { trade.qty },
+            sell_qty: if trade.is_sell { trade.qty } else { 0.0 },
+            first_time: trade.time,
+            last_time: trade.time,
+            buy_count: if trade.is_sell { 0 } else { 1 },
+            sell_count: if trade.is_sell { 1 } else { 0 },
+        }
+    }
+
+    fn add_trade(&mut self, trade: &Trade) {
+        if trade.is_sell {
+            self.sell_qty += trade.qty;
+            self.sell_count += 1;
+        } else {
+            self.buy_qty += trade.qty;
+            self.buy_count += 1;
+        }
+        self.last_time = trade.time;
+    }
+
+    pub fn total_qty(&self) -> f32 {
+        self.buy_qty + self.sell_qty
+    }
+
+    pub fn delta_qty(&self) -> f32 {
+        self.buy_qty - self.sell_qty
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct KlineTrades {
-    pub trades: HashMap<OrderedFloat<f32>, (f32, f32)>,
+    pub trades: HashMap<OrderedFloat<f32>, GroupedTrades>,
     pub poc: Option<PointOfControl>,
 }
 
@@ -20,19 +62,21 @@ impl KlineTrades {
         }
     }
 
+    pub fn first_trade_t(&self) -> Option<u64> {
+        self.trades.values().map(|group| group.first_time).min()
+    }
+
+    pub fn last_trade_t(&self) -> Option<u64> {
+        self.trades.values().map(|group| group.last_time).max()
+    }
+
     pub fn add_trade_at_price_level(&mut self, trade: &Trade, tick_size: f32) {
         let price_level = OrderedFloat(round_to_tick(trade.price, tick_size));
 
-        if let Some((buy_qty, sell_qty)) = self.trades.get_mut(&price_level) {
-            if trade.is_sell {
-                *sell_qty += trade.qty;
-            } else {
-                *buy_qty += trade.qty;
-            }
-        } else if trade.is_sell {
-            self.trades.insert(price_level, (0.0, trade.qty));
+        if let Some(group) = self.trades.get_mut(&price_level) {
+            group.add_trade(trade);
         } else {
-            self.trades.insert(price_level, (trade.qty, 0.0));
+            self.trades.insert(price_level, GroupedTrades::new(trade));
         }
     }
 
@@ -41,9 +85,9 @@ impl KlineTrades {
         F: Fn(f32, f32) -> f32,
     {
         let mut max_qty: f32 = 0.0;
-        for (price, (buy_qty, sell_qty)) in &self.trades {
+        for (price, group) in &self.trades {
             if price >= &lowest && price <= &highest {
-                max_qty = max_qty.max(f(*buy_qty, *sell_qty));
+                max_qty = max_qty.max(f(group.buy_qty, group.sell_qty));
             }
         }
         max_qty
@@ -57,8 +101,8 @@ impl KlineTrades {
         let mut max_volume = 0.0;
         let mut poc_price = 0.0;
 
-        for (price, (buy_qty, sell_qty)) in &self.trades {
-            let total_volume = buy_qty + sell_qty;
+        for (price, group) in &self.trades {
+            let total_volume = group.total_qty();
             if total_volume > max_volume {
                 max_volume = total_volume;
                 poc_price = price.0;

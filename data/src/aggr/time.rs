@@ -48,6 +48,14 @@ impl DataPoint {
     pub fn calculate_poc(&mut self) {
         self.footprint.calculate_poc();
     }
+
+    pub fn last_trade_time(&self) -> Option<u64> {
+        self.footprint.last_trade_t()
+    }
+
+    pub fn first_trade_time(&self) -> Option<u64> {
+        self.footprint.first_trade_t()
+    }
 }
 
 pub struct TimeSeries {
@@ -72,7 +80,7 @@ impl TimeSeries {
         timeseries.insert_klines(klines);
 
         if !raw_trades.is_empty() {
-            timeseries.insert_trades(raw_trades, None);
+            timeseries.insert_trades(raw_trades);
         }
 
         timeseries
@@ -125,7 +133,7 @@ impl TimeSeries {
         self.clear_trades();
 
         if !all_raw_trades.is_empty() {
-            self.insert_trades(all_raw_trades, None);
+            self.insert_trades(all_raw_trades);
         }
     }
 
@@ -145,19 +153,15 @@ impl TimeSeries {
         self.update_poc_status();
     }
 
-    pub fn insert_trades(&mut self, buffer: &[Trade], update_t: Option<u64>) {
+    pub fn insert_trades(&mut self, buffer: &[Trade]) {
         if buffer.is_empty() {
             return;
         }
-
-        let aggregate_time = self.interval.to_milliseconds();
-        let rounded_update_t = update_t.map(|t| (t / aggregate_time) * aggregate_time);
-
+        let aggr_time = self.interval.to_milliseconds();
         let mut updated_times = Vec::new();
 
         buffer.iter().for_each(|trade| {
-            let rounded_time =
-                rounded_update_t.unwrap_or((trade.time / aggregate_time) * aggregate_time);
+            let rounded_time = (trade.time / aggr_time) * aggr_time;
 
             if !updated_times.contains(&rounded_time) {
                 updated_times.push(rounded_time);
@@ -213,6 +217,155 @@ impl TimeSeries {
                 data_point.set_poc_status(npoc);
             }
         }
+    }
+
+    pub fn suggest_trade_fetch_range(
+        &self,
+        visible_earliest: u64,
+        visible_latest: u64,
+    ) -> Option<(u64, u64)> {
+        let (kline_earliest, kline_latest) = self.kline_timerange();
+
+        if let Some(range) = self.largest_trade_gap_range(
+            visible_earliest,
+            visible_latest,
+            kline_earliest,
+            kline_latest,
+        ) {
+            return Some(range);
+        }
+
+        // Fallback: find empty klines
+        self.get_empty_kline_range(
+            visible_earliest,
+            visible_latest,
+            kline_earliest,
+            kline_latest,
+        )
+    }
+
+    fn largest_trade_gap_range(
+        &self,
+        visible_earliest: u64,
+        visible_latest: u64,
+        kline_earliest: u64,
+        kline_latest: u64,
+    ) -> Option<(u64, u64)> {
+        let (last_trade_before_gap, first_trade_after_gap) = self.find_largest_trade_gap();
+
+        match (last_trade_before_gap, first_trade_after_gap) {
+            (Some(start), Some(end)) => {
+                let fetch_from = start.max(visible_earliest);
+                let fetch_to = end.min(visible_latest);
+                if fetch_from < fetch_to {
+                    Some((fetch_from, fetch_to))
+                } else {
+                    None
+                }
+            }
+            (Some(start), None) => {
+                let fetch_from = start.max(visible_earliest);
+                let fetch_to = kline_latest.min(visible_latest);
+                if fetch_from < fetch_to {
+                    Some((fetch_from, fetch_to))
+                } else {
+                    None
+                }
+            }
+            (None, Some(end)) => {
+                let fetch_from = kline_earliest.max(visible_earliest);
+                let fetch_to = end.min(visible_latest);
+                if fetch_from < fetch_to {
+                    Some((fetch_from, fetch_to))
+                } else {
+                    None
+                }
+            }
+            (None, None) => None,
+        }
+    }
+
+    fn get_empty_kline_range(
+        &self,
+        visible_earliest: u64,
+        visible_latest: u64,
+        kline_earliest: u64,
+        kline_latest: u64,
+    ) -> Option<(u64, u64)> {
+        let earliest_empty_time = self
+            .data_points
+            .range(visible_earliest..=visible_latest)
+            .find(|(_, dp)| dp.footprint.trades.is_empty())
+            .map(|(time, _)| *time)?;
+
+        let fetch_from = self
+            .data_points
+            .range(..earliest_empty_time)
+            .rev()
+            .find_map(|(_, dp)| dp.last_trade_time())
+            .unwrap_or(kline_earliest)
+            .max(visible_earliest);
+
+        let fetch_to = self
+            .data_points
+            .range(earliest_empty_time..)
+            .find_map(|(_, dp)| {
+                if !dp.footprint.trades.is_empty() {
+                    dp.first_trade_time()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(kline_latest)
+            .min(visible_latest);
+
+        if fetch_from < fetch_to {
+            Some((fetch_from, fetch_to))
+        } else {
+            None
+        }
+    }
+
+    pub fn find_largest_trade_gap(&self) -> (Option<u64>, Option<u64>) {
+        if self.data_points.is_empty() {
+            return (None, None);
+        }
+
+        let data_points_chronological: Vec<&DataPoint> = self.data_points.values().collect();
+
+        let mut max_gap_klines_count = 0;
+        let mut current_gap_klines_count = 0;
+
+        let mut result_last_trade_before_gap: Option<u64> = None;
+        let mut result_first_trade_after_gap: Option<u64> = None;
+
+        let mut last_trade_time_before_current_gap: Option<u64> = None;
+
+        for dp in data_points_chronological.iter() {
+            let kline_has_trades = !dp.footprint.trades.is_empty();
+
+            if kline_has_trades {
+                if current_gap_klines_count > 0 {
+                    if current_gap_klines_count > max_gap_klines_count {
+                        max_gap_klines_count = current_gap_klines_count;
+                        result_last_trade_before_gap = last_trade_time_before_current_gap;
+                        result_first_trade_after_gap = dp.footprint.first_trade_t();
+                    }
+                    current_gap_klines_count = 0;
+                }
+
+                last_trade_time_before_current_gap = dp.footprint.last_trade_t();
+            } else {
+                current_gap_klines_count += 1;
+            }
+        }
+
+        if current_gap_klines_count > 0 && current_gap_klines_count > max_gap_klines_count {
+            result_last_trade_before_gap = last_trade_time_before_current_gap;
+            result_first_trade_after_gap = None;
+        }
+
+        (result_last_trade_before_gap, result_first_trade_after_gap)
     }
 
     pub fn max_qty_ts_range(

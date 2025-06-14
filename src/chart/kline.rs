@@ -379,32 +379,10 @@ impl KlineChart {
                 }
 
                 if !self.fetching_trades.0 && exchange::fetcher::is_trade_fetch_enabled() {
-                    if let Some(earliest_gap) = timeseries
-                        .data_points
-                        .range(visible_earliest..=visible_latest)
-                        .filter(|(_, dp)| dp.footprint.trades.is_empty())
-                        .map(|(time, _)| *time)
-                        .min()
+                    if let Some((fetch_from, fetch_to)) =
+                        timeseries.suggest_trade_fetch_range(visible_earliest, visible_latest)
                     {
-                        let last_kline_before_gap = timeseries
-                            .data_points
-                            .range(..earliest_gap)
-                            .filter(|(_, dp)| !dp.footprint.trades.is_empty())
-                            .max_by_key(|(time, _)| *time)
-                            .map_or(earliest_gap, |(time, _)| *time);
-
-                        let first_kline_after_gap = timeseries
-                            .data_points
-                            .range(earliest_gap..)
-                            .filter(|(_, dp)| !dp.footprint.trades.is_empty())
-                            .min_by_key(|(time, _)| *time)
-                            .map_or(kline_latest, |(time, _)| *time - 1);
-
-                        let range = FetchRange::Trades(
-                            last_kline_before_gap.max(visible_earliest),
-                            first_kline_after_gap.min(visible_latest),
-                        );
-
+                        let range = FetchRange::Trades(fetch_from, fetch_to);
                         if let Some(action) = request_fetch(&mut self.request_handler, range) {
                             self.fetching_trades = (true, None);
                             return Some(action);
@@ -484,7 +462,7 @@ impl KlineChart {
                 if clear_raw {
                     self.raw_trades.clear();
                 } else {
-                    source.insert_trades(&self.raw_trades, None);
+                    source.insert_trades(&self.raw_trades);
                 }
             }
             ChartData::TickBased(_) => {
@@ -599,7 +577,7 @@ impl KlineChart {
         (from_time, to_time)
     }
 
-    pub fn insert_trades_buffer(&mut self, trades_buffer: &[Trade], depth_update: u64) {
+    pub fn insert_trades_buffer(&mut self, trades_buffer: &[Trade]) {
         self.raw_trades.extend_from_slice(trades_buffer);
 
         match self.data_source {
@@ -627,7 +605,7 @@ impl KlineChart {
                 self.invalidate(None);
             }
             ChartData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades(trades_buffer, Some(depth_update));
+                timeseries.insert_trades(trades_buffer);
             }
         }
     }
@@ -638,7 +616,7 @@ impl KlineChart {
                 tick_aggr.insert_trades(&raw_trades);
             }
             ChartData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades(&raw_trades, None);
+                timeseries.insert_trades(&raw_trades);
             }
         }
 
@@ -1202,7 +1180,7 @@ fn draw_clusters(
             let should_show_text = cell_height_unscaled > 8.0 && cell_width_unscaled > 80.0;
             let bar_color_alpha = if should_show_text { 0.25 } else { 1.0 };
 
-            for (price, (buy_qty, sell_qty)) in &footprint.trades {
+            for (price, group) in &footprint.trades {
                 let y_position = price_to_y(**price);
 
                 if let Some((threshold, color_scale, ignore_zeros)) = imbalance {
@@ -1213,7 +1191,7 @@ fn draw_clusters(
                         &price_to_y,
                         footprint,
                         *price,
-                        *sell_qty,
+                        group.sell_qty,
                         higher_price,
                         threshold,
                         color_scale,
@@ -1232,8 +1210,8 @@ fn draw_clusters(
                     frame,
                     start_x,
                     y_position,
-                    *buy_qty,
-                    *sell_qty,
+                    group.buy_qty,
+                    group.sell_qty,
                     max_cluster_qty,
                     cell_height,
                     cell_width * 0.8,
@@ -1245,7 +1223,7 @@ fn draw_clusters(
                 if should_show_text {
                     draw_cluster_text(
                         frame,
-                        &abbr_large_numbers(buy_qty + sell_qty),
+                        &abbr_large_numbers(group.total_qty()),
                         Point::new(start_x, y_position),
                         text_size,
                         text_color,
@@ -1259,7 +1237,7 @@ fn draw_clusters(
             let should_show_text = cell_height_unscaled > 8.0 && cell_width_unscaled > 80.0;
             let bar_color_alpha = if should_show_text { 0.25 } else { 1.0 };
 
-            for (price, (buy_qty, sell_qty)) in &footprint.trades {
+            for (price, group) in &footprint.trades {
                 let y_position = price_to_y(**price);
 
                 if let Some((threshold, color_scale, ignore_zeros)) = imbalance {
@@ -1270,7 +1248,7 @@ fn draw_clusters(
                         &price_to_y,
                         footprint,
                         *price,
-                        *sell_qty,
+                        group.sell_qty,
                         higher_price,
                         threshold,
                         color_scale,
@@ -1283,7 +1261,7 @@ fn draw_clusters(
                     );
                 }
 
-                let delta_qty = buy_qty - sell_qty;
+                let delta_qty = group.delta_qty();
 
                 if should_show_text {
                     draw_cluster_text(
@@ -1318,7 +1296,7 @@ fn draw_clusters(
             let should_show_text = cell_height_unscaled > 8.0 && cell_width_unscaled > 120.0;
             let bar_color_alpha = if should_show_text { 0.25 } else { 1.0 };
 
-            for (price, (buy_qty, sell_qty)) in &footprint.trades {
+            for (price, group) in &footprint.trades {
                 let y_position = price_to_y(**price);
 
                 if let Some((threshold, color_scale, ignore_zeros)) = imbalance {
@@ -1329,7 +1307,7 @@ fn draw_clusters(
                         &price_to_y,
                         footprint,
                         *price,
-                        *sell_qty,
+                        group.sell_qty,
                         higher_price,
                         threshold,
                         color_scale,
@@ -1342,11 +1320,11 @@ fn draw_clusters(
                     );
                 }
 
-                if *buy_qty > 0.0 {
+                if group.buy_qty > 0.0 {
                     if should_show_text {
                         draw_cluster_text(
                             frame,
-                            &abbr_large_numbers(*buy_qty),
+                            &abbr_large_numbers(group.buy_qty),
                             Point::new(x_position + (candle_width / 4.0), y_position),
                             text_size,
                             text_color,
@@ -1355,7 +1333,7 @@ fn draw_clusters(
                         );
                     }
 
-                    let bar_width = (buy_qty / max_cluster_qty) * (cell_width * 0.4);
+                    let bar_width = (group.buy_qty / max_cluster_qty) * (cell_width * 0.4);
                     frame.fill_rectangle(
                         Point::new(
                             x_position + (candle_width / 4.0),
@@ -1366,11 +1344,11 @@ fn draw_clusters(
                     );
                 }
 
-                if *sell_qty > 0.0 {
+                if group.sell_qty > 0.0 {
                     if should_show_text {
                         draw_cluster_text(
                             frame,
-                            &abbr_large_numbers(*sell_qty),
+                            &abbr_large_numbers(group.sell_qty),
                             Point::new(x_position - (candle_width / 4.0), y_position),
                             text_size,
                             text_color,
@@ -1379,7 +1357,7 @@ fn draw_clusters(
                         );
                     }
 
-                    let bar_width = -(sell_qty / max_cluster_qty) * (cell_width * 0.4);
+                    let bar_width = -(group.sell_qty / max_cluster_qty) * (cell_width * 0.4);
                     frame.fill_rectangle(
                         Point::new(
                             x_position - (candle_width / 4.0),
@@ -1416,7 +1394,9 @@ fn draw_imbalance_marker(
         return;
     }
 
-    if let Some((diagonal_buy_qty, _)) = footprint.trades.get(&higher_price) {
+    if let Some(group) = footprint.trades.get(&higher_price) {
+        let diagonal_buy_qty = &group.buy_qty;
+
         if ignore_zeros && *diagonal_buy_qty <= 0.0 {
             return;
         }
