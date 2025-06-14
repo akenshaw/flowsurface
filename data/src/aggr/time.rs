@@ -255,18 +255,18 @@ impl TimeSeries {
 
         match (last_trade_before_gap, first_trade_after_gap) {
             (Some(start), Some(end)) => {
-                let fetch_from = start.max(visible_earliest);
-                let fetch_to = end.min(visible_latest);
-                if fetch_from < fetch_to {
+                let fetch_from = (start + 1).max(visible_earliest);
+                let fetch_to = (end.saturating_sub(1)).min(visible_latest);
+                if fetch_from <= fetch_to {
                     Some((fetch_from, fetch_to))
                 } else {
                     None
                 }
             }
             (Some(start), None) => {
-                let fetch_from = start.max(visible_earliest);
+                let fetch_from = (start + 1).max(visible_earliest);
                 let fetch_to = kline_latest.min(visible_latest);
-                if fetch_from < fetch_to {
+                if fetch_from <= fetch_to {
                     Some((fetch_from, fetch_to))
                 } else {
                     None
@@ -274,8 +274,8 @@ impl TimeSeries {
             }
             (None, Some(end)) => {
                 let fetch_from = kline_earliest.max(visible_earliest);
-                let fetch_to = end.min(visible_latest);
-                if fetch_from < fetch_to {
+                let fetch_to = (end.saturating_sub(1)).min(visible_latest);
+                if fetch_from <= fetch_to {
                     Some((fetch_from, fetch_to))
                 } else {
                     None
@@ -298,35 +298,41 @@ impl TimeSeries {
             .find(|(_, dp)| dp.footprint.trades.is_empty())
             .map(|(time, _)| *time)?;
 
-        let fetch_from = self
+        let last_trade_before_gap = self
             .data_points
             .range(..earliest_empty_time)
             .rev()
-            .find_map(|(_, dp)| dp.last_trade_time())
-            .unwrap_or(kline_earliest)
-            .max(visible_earliest);
+            .find_map(|(_, dp)| dp.last_trade_time());
 
-        let fetch_to = self
-            .data_points
-            .range(earliest_empty_time..)
-            .find_map(|(_, dp)| {
-                if !dp.footprint.trades.is_empty() {
-                    dp.first_trade_time()
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(kline_latest)
-            .min(visible_latest);
+        let first_trade_after_gap =
+            self.data_points
+                .range(earliest_empty_time..)
+                .find_map(|(_, dp)| {
+                    if !dp.footprint.trades.is_empty() {
+                        dp.first_trade_time()
+                    } else {
+                        None
+                    }
+                });
 
-        if fetch_from < fetch_to {
+        let fetch_from = match last_trade_before_gap {
+            Some(time) => (time + 1).max(visible_earliest),
+            None => kline_earliest.max(visible_earliest),
+        };
+
+        let fetch_to = match first_trade_after_gap {
+            Some(time) => (time.saturating_sub(1)).min(visible_latest),
+            None => kline_latest.min(visible_latest),
+        };
+
+        if fetch_from <= fetch_to {
             Some((fetch_from, fetch_to))
         } else {
             None
         }
     }
 
-    pub fn find_largest_trade_gap(&self) -> (Option<u64>, Option<u64>) {
+    fn find_largest_trade_gap(&self) -> (Option<u64>, Option<u64>) {
         if self.data_points.is_empty() {
             return (None, None);
         }
