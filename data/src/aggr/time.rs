@@ -224,115 +224,59 @@ impl TimeSeries {
         visible_earliest: u64,
         visible_latest: u64,
     ) -> Option<(u64, u64)> {
-        let (kline_earliest_internal, kline_latest_internal) = self.kline_timerange();
-        let (last_trade_before_gap, first_trade_after_gap) = self.find_largest_trade_gap();
+        let (kline_earliest, kline_latest) = self.kline_timerange();
 
-        let mut suggested_range: Option<(u64, u64)> = None;
-
-        if let (Some(start_gap_trade_time), Some(end_gap_trade_time)) =
-            (last_trade_before_gap, first_trade_after_gap)
-        {
-            let fetch_from = start_gap_trade_time.max(visible_earliest);
-            let fetch_to = end_gap_trade_time.min(visible_latest);
-            if fetch_from < fetch_to {
-                suggested_range = Some((fetch_from, fetch_to));
-            }
-        } else if let (Some(start_gap_trade_time), None) =
-            (last_trade_before_gap, first_trade_after_gap)
-        {
-            let fetch_from = start_gap_trade_time.max(visible_earliest);
-            let fetch_to = kline_latest_internal.min(visible_latest);
-            if fetch_from < fetch_to {
-                suggested_range = Some((fetch_from, fetch_to));
-            }
-        } else if let (None, Some(end_gap_trade_time)) =
-            (last_trade_before_gap, first_trade_after_gap)
-        {
-            let fetch_from = kline_earliest_internal.max(visible_earliest);
-            let fetch_to = end_gap_trade_time.min(visible_latest);
-            if fetch_from < fetch_to {
-                suggested_range = Some((fetch_from, fetch_to));
-            }
+        if self.data_points.is_empty() {
+            return None;
         }
 
-        if suggested_range.is_none() {
-            if let Some(earliest_empty_kline_time) = self
-                .data_points
-                .range(visible_earliest..=visible_latest)
-                .filter(|(_, dp)| dp.footprint.trades.is_empty())
-                .map(|(time, _)| *time)
-                .min()
-            {
-                let last_trade_before_empty_kline = self
-                    .data_points
-                    .range(..earliest_empty_kline_time)
-                    .rev()
-                    .find_map(|(_, dp)| dp.last_trade_time())
-                    .unwrap_or(kline_earliest_internal.max(visible_earliest));
+        if let Some((last_trade_before_gap, first_trade_after_gap)) = self.find_trade_gap() {
+            let fetch_from_candidate = last_trade_before_gap.unwrap_or(kline_earliest);
+            let fetch_to_candidate = first_trade_after_gap.unwrap_or(kline_latest);
 
-                let first_trade_after_empty_kline = self
-                    .data_points
-                    .range(earliest_empty_kline_time..)
-                    .find_map(|(_, dp)| {
-                        if !dp.footprint.trades.is_empty() {
-                            dp.first_trade_time()
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(kline_latest_internal.min(visible_latest));
+            let fetch_from = fetch_from_candidate.max(visible_earliest);
+            let fetch_to = fetch_to_candidate.min(visible_latest);
 
-                let fetch_from = last_trade_before_empty_kline.max(visible_earliest);
-                let fetch_to = first_trade_after_empty_kline.min(visible_latest);
-
-                if fetch_from < fetch_to {
-                    suggested_range = Some((fetch_from, fetch_to));
-                }
+            if fetch_from < fetch_to {
+                Some((fetch_from, fetch_to))
+            } else {
+                None
             }
+        } else {
+            None
         }
-        suggested_range
     }
 
-    fn find_largest_trade_gap(&self) -> (Option<u64>, Option<u64>) {
+    fn find_trade_gap(&self) -> Option<(Option<u64>, Option<u64>)> {
         if self.data_points.is_empty() {
-            return (None, None);
+            return None;
         }
 
-        let data_points_chronological: Vec<&DataPoint> = self.data_points.values().collect();
+        let mut empty_kline_time: Option<u64> = None;
 
-        let mut max_gap_klines_count = 0;
-        let mut current_gap_klines_count = 0;
-
-        let mut result_last_trade_before_gap: Option<u64> = None;
-        let mut result_first_trade_after_gap: Option<u64> = None;
-
-        let mut last_trade_time_before_current_gap: Option<u64> = None;
-
-        for dp in data_points_chronological.iter() {
-            let kline_has_trades = !dp.footprint.trades.is_empty();
-
-            if kline_has_trades {
-                if current_gap_klines_count > 0 {
-                    if current_gap_klines_count > max_gap_klines_count {
-                        max_gap_klines_count = current_gap_klines_count;
-                        result_last_trade_before_gap = last_trade_time_before_current_gap;
-                        result_first_trade_after_gap = dp.footprint.first_trade_t();
-                    }
-                    current_gap_klines_count = 0;
-                }
-
-                last_trade_time_before_current_gap = dp.footprint.last_trade_t();
-            } else {
-                current_gap_klines_count += 1;
+        for (&time, dp) in self.data_points.iter().rev() {
+            if dp.footprint.trades.is_empty() {
+                empty_kline_time = Some(time);
+                break;
             }
         }
 
-        if current_gap_klines_count > 0 && current_gap_klines_count > max_gap_klines_count {
-            result_last_trade_before_gap = last_trade_time_before_current_gap;
-            result_first_trade_after_gap = None;
-        }
+        if let Some(target_empty_time) = empty_kline_time {
+            let last_trade_before_gap = self
+                .data_points
+                .range(..target_empty_time)
+                .rev()
+                .find_map(|(_, dp)| dp.last_trade_time());
 
-        (result_last_trade_before_gap, result_first_trade_after_gap)
+            let first_trade_after_gap = self
+                .data_points
+                .range((target_empty_time + 1)..)
+                .find_map(|(_, dp)| dp.first_trade_time());
+
+            Some((last_trade_before_gap, first_trade_after_gap))
+        } else {
+            None
+        }
     }
 
     pub fn max_qty_ts_range(
