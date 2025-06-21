@@ -153,6 +153,26 @@ impl TimeSeries {
         self.update_poc_status();
     }
 
+    pub fn min_max_price_in_range(
+        &self,
+        earliest: u64,
+        latest: u64,
+    ) -> Option<(OrderedFloat<f32>, OrderedFloat<f32>)> {
+        let mut min_price = OrderedFloat(f32::MAX);
+        let mut max_price = OrderedFloat(f32::MIN);
+
+        for (_, data_point) in self.datapoints.range(earliest..=latest) {
+            min_price = min_price.min(OrderedFloat(data_point.kline.low));
+            max_price = max_price.max(OrderedFloat(data_point.kline.high));
+        }
+
+        if min_price.0 == f32::MAX || max_price.0 == f32::MIN {
+            None
+        } else {
+            Some((min_price, max_price))
+        }
+    }
+
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
         if buffer.is_empty() {
             return;
@@ -236,12 +256,10 @@ impl TimeSeries {
                 let (kline_earliest, kline_latest) = self.kline_timerange();
 
                 let fetch_from = last_t_before_gap
-                    .map(|t| t.saturating_add(1))
-                    .unwrap_or(kline_earliest)
+                    .map_or(kline_earliest, |t| t.saturating_add(1))
                     .max(visible_earliest);
                 let fetch_to = first_t_after_gap
-                    .map(|t| t.saturating_sub(1))
-                    .unwrap_or(kline_latest)
+                    .map_or(kline_latest, |t| t.saturating_sub(1))
                     .min(visible_latest);
 
                 if fetch_from < fetch_to {

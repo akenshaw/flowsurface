@@ -1,5 +1,5 @@
 use super::{
-    Chart, ChartConstants, CommonChartData, Interaction, Message, scale::linear::PriceInfoLabel,
+    Chart, ChartConstants, Interaction, Message, ViewState, scale::linear::PriceInfoLabel,
 };
 use crate::{chart::TEXT_SIZE, style};
 use data::chart::{
@@ -31,11 +31,11 @@ const TOOLTIP_PADDING: f32 = 12.0;
 impl Chart for HeatmapChart {
     type IndicatorType = HeatmapIndicator;
 
-    fn common_data(&self) -> &CommonChartData {
+    fn state(&self) -> &ViewState {
         &self.chart
     }
 
-    fn common_data_mut(&mut self) -> &mut CommonChartData {
+    fn mut_state(&mut self) -> &mut ViewState {
         &mut self.chart
     }
 
@@ -48,7 +48,7 @@ impl Chart for HeatmapChart {
     }
 
     fn visible_timerange(&self) -> (u64, u64) {
-        let chart = self.common_data();
+        let chart = self.state();
         let visible_region = chart.visible_region(chart.bounds.size());
 
         (
@@ -62,11 +62,15 @@ impl Chart for HeatmapChart {
     }
 
     fn autoscaled_coords(&self) -> Vector {
-        let chart = self.common_data();
+        let chart = self.state();
         Vector::new(
             0.5 * (chart.bounds.width / chart.scaling) - (90.0 / chart.scaling),
-            0.0,
+            chart.translation.y,
         )
+    }
+
+    fn supports_fit_autoscaling(&self) -> bool {
+        false
     }
 
     fn is_empty(&self) -> bool {
@@ -110,7 +114,7 @@ enum IndicatorData {
 }
 
 pub struct HeatmapChart {
-    chart: CommonChartData,
+    chart: ViewState,
     timeseries: BTreeMap<u64, (Box<[GroupedTrade]>, (f32, f32))>,
     indicators: HashMap<HeatmapIndicator, IndicatorData>,
     pause_buffer: Vec<(u64, Box<[Trade]>, Depth)>,
@@ -129,13 +133,12 @@ impl HeatmapChart {
         config: Option<Config>,
     ) -> Self {
         HeatmapChart {
-            chart: CommonChartData {
+            chart: ViewState {
                 cell_width: data::chart::heatmap::DEFAULT_CELL_WIDTH,
                 cell_height: 4.0,
                 tick_size,
                 decimals: count_decimals(tick_size),
-                crosshair: layout.crosshair,
-                splits: layout.splits,
+                layout,
                 ticker_info,
                 basis,
                 ..Default::default()
@@ -338,8 +341,11 @@ impl HeatmapChart {
             basis,
         );
 
-        let autoscaled_coords = self.autoscaled_coords();
-        self.chart.translation = autoscaled_coords;
+        let chart = &mut self.chart;
+        chart.translation = Vector::new(
+            0.5 * (chart.bounds.width / chart.scaling) - (90.0 / chart.scaling),
+            0.0,
+        );
 
         self.invalidate(None);
     }
@@ -352,11 +358,11 @@ impl HeatmapChart {
     }
 
     pub fn chart_layout(&self) -> ChartLayout {
-        self.chart.get_chart_layout()
+        self.chart.layout()
     }
 
     pub fn change_tick_size(&mut self, new_tick_size: f32) {
-        let chart_state = self.common_data_mut();
+        let chart_state = self.mut_state();
 
         let basis = chart_state.basis;
 
@@ -404,11 +410,13 @@ impl HeatmapChart {
     }
 
     pub fn invalidate(&mut self, now: Option<Instant>) -> Option<super::Action> {
-        let autoscaled_coords = self.autoscaled_coords();
         let chart = &mut self.chart;
 
-        if chart.autoscale {
-            chart.translation = autoscaled_coords;
+        if chart.layout.autoscale.is_some() {
+            chart.translation = Vector::new(
+                0.5 * (chart.bounds.width / chart.scaling) - (90.0 / chart.scaling),
+                0.0,
+            );
         }
 
         chart.cache.clear_all();
@@ -503,7 +511,7 @@ impl canvas::Program<Message> for HeatmapChart {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let chart = self.common_data();
+        let chart = self.state();
 
         if chart.bounds.width == 0.0 {
             return vec![];
@@ -850,7 +858,7 @@ impl canvas::Program<Message> for HeatmapChart {
             }
         });
 
-        if chart.crosshair & !self.timeseries.is_empty() {
+        if chart.layout.crosshair & !self.timeseries.is_empty() {
             let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     let (cursor_at_price, cursor_at_time) =
@@ -979,7 +987,7 @@ impl canvas::Program<Message> for HeatmapChart {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
             Interaction::None => {
-                if cursor.is_over(bounds) && self.chart.crosshair {
+                if cursor.is_over(bounds) && self.chart.layout.crosshair {
                     return mouse::Interaction::Crosshair;
                 }
                 mouse::Interaction::default()

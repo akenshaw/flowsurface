@@ -1,5 +1,5 @@
 use super::{
-    Action, Basis, Caches, Chart, ChartConstants, ChartData, CommonChartData, Interaction, Message,
+    Action, Basis, Caches, Chart, ChartConstants, ChartData, Interaction, Message, ViewState,
     indicator, request_fetch, scale::linear::PriceInfoLabel,
 };
 use crate::{modal::pane::settings::study, style};
@@ -30,11 +30,11 @@ use std::time::Instant;
 impl Chart for KlineChart {
     type IndicatorType = KlineIndicator;
 
-    fn common_data(&self) -> &CommonChartData {
+    fn state(&self) -> &ViewState {
         &self.chart
     }
 
-    fn common_data_mut(&mut self) -> &mut CommonChartData {
+    fn mut_state(&mut self) -> &mut ViewState {
         &mut self.chart
     }
 
@@ -43,7 +43,7 @@ impl Chart for KlineChart {
     }
 
     fn view_indicators(&self, enabled: &[Self::IndicatorType]) -> Vec<Element<Message>> {
-        let chart_state: &CommonChartData = self.common_data();
+        let chart_state = self.state();
 
         let visible_region = chart_state.visible_region(chart_state.bounds.size());
         let (earliest, latest) = chart_state.interval_range(&visible_region);
@@ -73,7 +73,7 @@ impl Chart for KlineChart {
     }
 
     fn visible_timerange(&self) -> (u64, u64) {
-        let chart = self.common_data();
+        let chart = self.state();
         let region = chart.visible_region(chart.bounds.size());
 
         match &chart.basis {
@@ -107,19 +107,21 @@ impl Chart for KlineChart {
     }
 
     fn autoscaled_coords(&self) -> Vector {
-        let chart = self.common_data();
-
-        match &self.kind {
-            KlineChartKind::Footprint { .. } => Vector::new(
-                0.5 * (chart.bounds.width / chart.scaling) - (chart.cell_width / chart.scaling),
-                self.data_source.latest_y_midpoint(chart),
-            ),
-            KlineChartKind::Candles => Vector::new(
+        let chart = self.state();
+        let x_translation = match &self.kind {
+            KlineChartKind::Footprint { .. } => {
+                0.5 * (chart.bounds.width / chart.scaling) - (chart.cell_width / chart.scaling)
+            }
+            KlineChartKind::Candles => {
                 0.5 * (chart.bounds.width / chart.scaling)
-                    - (8.0 * chart.cell_width / chart.scaling),
-                self.data_source.latest_y_midpoint(chart),
-            ),
-        }
+                    - (8.0 * chart.cell_width / chart.scaling)
+            }
+        };
+        Vector::new(x_translation, chart.translation.y)
+    }
+
+    fn supports_fit_autoscaling(&self) -> bool {
+        true
     }
 
     fn is_empty(&self) -> bool {
@@ -146,7 +148,7 @@ impl IndicatorData {
 
     fn indicator_elem<'a>(
         &'a self,
-        chart: &'a CommonChartData,
+        chart: &'a ViewState,
         earliest: u64,
         latest: u64,
     ) -> Element<'a, Message> {
@@ -192,7 +194,7 @@ impl ChartConstants for KlineChart {
 }
 
 pub struct KlineChart {
-    chart: CommonChartData,
+    chart: ViewState,
     data_source: ChartData,
     raw_trades: Vec<Trade>,
     indicators: HashMap<KlineIndicator, IndicatorData>,
@@ -247,26 +249,39 @@ impl KlineChart {
                     })
                     .collect();
 
-                KlineChart {
-                    chart: CommonChartData {
-                        cell_width: match kind {
-                            KlineChartKind::Footprint { .. } => 80.0,
-                            KlineChartKind::Candles => 4.0,
-                        },
-                        cell_height: match kind {
-                            KlineChartKind::Footprint { .. } => 800.0 / y_ticks,
-                            KlineChartKind::Candles => 200.0 / y_ticks,
-                        },
-                        base_price_y,
-                        latest_x,
-                        tick_size,
-                        decimals: count_decimals(tick_size),
-                        crosshair: layout.crosshair,
-                        splits: layout.splits,
-                        ticker_info,
-                        basis,
-                        ..Default::default()
+                let mut chart = ViewState {
+                    cell_width: match kind {
+                        KlineChartKind::Footprint { .. } => 80.0,
+                        KlineChartKind::Candles => 4.0,
                     },
+                    cell_height: match kind {
+                        KlineChartKind::Footprint { .. } => 800.0 / y_ticks,
+                        KlineChartKind::Candles => 200.0 / y_ticks,
+                    },
+                    base_price_y,
+                    latest_x,
+                    tick_size,
+                    decimals: count_decimals(tick_size),
+                    layout,
+                    ticker_info,
+                    basis,
+                    ..Default::default()
+                };
+
+                let x_translation = match &kind {
+                    KlineChartKind::Footprint { .. } => {
+                        0.5 * (chart.bounds.width / chart.scaling)
+                            - (chart.cell_width / chart.scaling)
+                    }
+                    KlineChartKind::Candles => {
+                        0.5 * (chart.bounds.width / chart.scaling)
+                            - (8.0 * chart.cell_width / chart.scaling)
+                    }
+                };
+                chart.translation.x = x_translation;
+
+                KlineChart {
+                    chart,
                     data_source: ChartData::TimeBased(timeseries),
                     raw_trades,
                     indicators: enabled_indicators,
@@ -298,24 +313,37 @@ impl KlineChart {
                     })
                     .collect();
 
-                KlineChart {
-                    chart: CommonChartData {
-                        cell_width: match kind {
-                            KlineChartKind::Footprint { .. } => 80.0,
-                            KlineChartKind::Candles => 4.0,
-                        },
-                        cell_height: match kind {
-                            KlineChartKind::Footprint { .. } => 90.0,
-                            KlineChartKind::Candles => 8.0,
-                        },
-                        tick_size,
-                        decimals: count_decimals(tick_size),
-                        crosshair: layout.crosshair,
-                        splits: layout.splits,
-                        ticker_info,
-                        basis,
-                        ..Default::default()
+                let mut chart = ViewState {
+                    cell_width: match kind {
+                        KlineChartKind::Footprint { .. } => 80.0,
+                        KlineChartKind::Candles => 4.0,
                     },
+                    cell_height: match kind {
+                        KlineChartKind::Footprint { .. } => 90.0,
+                        KlineChartKind::Candles => 8.0,
+                    },
+                    tick_size,
+                    decimals: count_decimals(tick_size),
+                    layout,
+                    ticker_info,
+                    basis,
+                    ..Default::default()
+                };
+
+                let x_translation = match &kind {
+                    KlineChartKind::Footprint { .. } => {
+                        0.5 * (chart.bounds.width / chart.scaling)
+                            - (chart.cell_width / chart.scaling)
+                    }
+                    KlineChartKind::Candles => {
+                        0.5 * (chart.bounds.width / chart.scaling)
+                            - (8.0 * chart.cell_width / chart.scaling)
+                    }
+                };
+                chart.translation.x = x_translation;
+
+                KlineChart {
+                    chart,
                     data_source: ChartData::TickBased(TickAggr::new(
                         interval,
                         tick_size,
@@ -344,7 +372,7 @@ impl KlineChart {
                     data.insert(kline.time, (kline.volume.0, kline.volume.1));
                 };
 
-                let chart = self.common_data_mut();
+                let chart = self.mut_state();
 
                 if (kline.time) > chart.latest_x {
                     chart.latest_x = kline.time;
@@ -514,7 +542,7 @@ impl KlineChart {
     }
 
     pub fn chart_layout(&self) -> ChartLayout {
-        self.chart.get_chart_layout()
+        self.chart.layout()
     }
 
     pub fn set_cluster_kind(&mut self, new_kind: ClusterKind) {
@@ -529,7 +557,7 @@ impl KlineChart {
     }
 
     pub fn change_tick_size(&mut self, new_tick_size: f32) {
-        let chart = self.common_data_mut();
+        let chart = self.mut_state();
 
         chart.cell_height *= new_tick_size / chart.tick_size;
         chart.tick_size = new_tick_size;
@@ -710,11 +738,79 @@ impl KlineChart {
     }
 
     pub fn invalidate(&mut self, now: Option<Instant>) -> Option<Action> {
-        let autoscaled_coords = self.autoscaled_coords();
         let chart = &mut self.chart;
 
-        if chart.autoscale {
-            chart.translation = autoscaled_coords;
+        if let Some(autoscale) = chart.layout.autoscale {
+            match autoscale {
+                super::Autoscale::CenterLatest => {
+                    let x_translation = match &self.kind {
+                        KlineChartKind::Footprint { .. } => {
+                            0.5 * (chart.bounds.width / chart.scaling)
+                                - (chart.cell_width / chart.scaling)
+                        }
+                        KlineChartKind::Candles => {
+                            0.5 * (chart.bounds.width / chart.scaling)
+                                - (8.0 * chart.cell_width / chart.scaling)
+                        }
+                    };
+                    chart.translation.x = x_translation;
+
+                    let calculate_target_y = |kline: exchange::Kline| -> f32 {
+                        let y_low = chart.price_to_y(kline.low);
+                        let y_high = chart.price_to_y(kline.high);
+                        let y_close = chart.price_to_y(kline.close);
+
+                        let mut target_y_translation = -(y_low + y_high) / 2.0;
+
+                        if chart.bounds.height > f32::EPSILON && chart.scaling > f32::EPSILON {
+                            let visible_half_height = (chart.bounds.height / chart.scaling) / 2.0;
+
+                            let view_center_y_centered = -target_y_translation;
+
+                            let visible_y_top = view_center_y_centered - visible_half_height;
+                            let visible_y_bottom = view_center_y_centered + visible_half_height;
+
+                            let padding = chart.cell_height;
+
+                            if y_close < visible_y_top {
+                                target_y_translation = -(y_close - padding + visible_half_height);
+                            } else if y_close > visible_y_bottom {
+                                target_y_translation = -(y_close + padding - visible_half_height);
+                            }
+                        }
+                        target_y_translation
+                    };
+
+                    chart.translation.y = self.data_source.latest_y_midpoint(calculate_target_y);
+                }
+                super::Autoscale::FitToVisible => {
+                    let visible_region = chart.visible_region(chart.bounds.size());
+                    let (start_interval, end_interval) = chart.interval_range(&visible_region);
+
+                    if let Some((lowest, highest)) = self
+                        .data_source
+                        .visible_price_range(start_interval, end_interval)
+                    {
+                        let highest = *highest;
+                        let lowest = *lowest;
+
+                        let padding = (highest - lowest) * 0.05;
+                        let price_span = (highest - lowest) + (2.0 * padding);
+
+                        if price_span > f32::EPSILON && chart.bounds.height > f32::EPSILON {
+                            let padded_highest = highest + padding;
+                            let chart_height = chart.bounds.height;
+                            let tick_size = chart.tick_size;
+
+                            if tick_size > f32::EPSILON {
+                                chart.cell_height = (chart_height * tick_size) / price_span;
+                                chart.base_price_y = padded_highest;
+                                chart.translation.y = -chart_height / 2.0;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         chart.cache.clear_all();
@@ -756,9 +852,9 @@ impl KlineChart {
             }
         }
 
-        if let Some(main_split) = self.chart.splits.first() {
+        if let Some(main_split) = self.chart.layout.splits.first() {
             let current_indi_count = self.indicators.len();
-            self.chart.splits = data::util::calc_panel_splits(
+            self.chart.layout.splits = data::util::calc_panel_splits(
                 *main_split,
                 current_indi_count,
                 Some(prev_indi_count),
@@ -788,7 +884,7 @@ impl canvas::Program<Message> for KlineChart {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let chart = self.common_data();
+        let chart = self.state();
 
         if chart.bounds.width == 0.0 {
             return vec![];
@@ -915,7 +1011,7 @@ impl canvas::Program<Message> for KlineChart {
             chart.draw_last_price_line(frame, palette, region);
         });
 
-        if chart.crosshair {
+        if chart.layout.crosshair {
             let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
                 if let Some(cursor_position) = cursor.position_in(bounds) {
                     let (_, rounded_aggregation) =
@@ -941,7 +1037,7 @@ impl canvas::Program<Message> for KlineChart {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
             Interaction::None => {
-                if cursor.is_over(bounds) && self.chart.crosshair {
+                if cursor.is_over(bounds) && self.chart.layout.crosshair {
                     return mouse::Interaction::Crosshair;
                 }
                 mouse::Interaction::default()

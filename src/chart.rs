@@ -6,28 +6,21 @@ mod scale;
 use crate::style;
 use crate::widget::multi_split::{DRAG_SIZE, MultiSplit};
 use crate::widget::tooltip;
-use data::aggr::{ticks::TickAggr, time::TimeSeries};
-use data::chart::{Basis, ChartLayout, indicator::Indicator};
+use data::chart::{Autoscale, Basis, ChartConstants, ChartData, ChartLayout, indicator::Indicator};
 use exchange::fetcher::{FetchRange, RequestHandler};
 use exchange::{TickerInfo, Timeframe};
 use scale::linear::PriceInfoLabel;
 use scale::{AxisLabelsX, AxisLabelsY};
 
 use iced::theme::palette::Extended;
-use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, LineDash, Stroke};
-use iced::widget::{center, horizontal_rule, mouse_area, vertical_rule};
+use iced::widget::canvas::{self, Cache, Canvas, Event, Frame, LineDash, Path, Stroke};
 use iced::{
-    Element, Length, Point, Rectangle, Size, Theme, Vector, alignment,
-    mouse::{self},
-    padding,
+    Element, Length, Point, Rectangle, Size, Theme, Vector, alignment, mouse, padding,
     widget::{
-        Space, button, canvas::Path, column, container, row, text,
-        tooltip::Position as TooltipPosition,
+        Space, button, center, column, container, horizontal_rule, mouse_area, row, text,
+        vertical_rule,
     },
 };
-
-const DEFAULT_CELL_WIDTH: f32 = 4.0;
-const DEFAULT_CELL_HEIGHT: f32 = 3.0;
 
 const ZOOM_SENSITIVITY: f32 = 30.0;
 const TEXT_SIZE: f32 = 12.0;
@@ -45,20 +38,10 @@ pub enum Interaction {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum AxisScaleClicked {
     X,
     Y,
-}
-
-pub trait ChartConstants {
-    fn min_scaling(&self) -> f32;
-    fn max_scaling(&self) -> f32;
-    fn max_cell_width(&self) -> f32;
-    fn min_cell_width(&self) -> f32;
-    fn max_cell_height(&self) -> f32;
-    fn min_cell_height(&self) -> f32;
-    fn default_cell_width(&self) -> f32;
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +61,9 @@ pub enum Message {
 pub trait Chart: ChartConstants + canvas::Program<Message> {
     type IndicatorType: Indicator;
 
-    fn common_data(&self) -> &CommonChartData;
+    fn state(&self) -> &ViewState;
 
-    fn common_data_mut(&mut self) -> &mut CommonChartData;
+    fn mut_state(&mut self) -> &mut ViewState;
 
     fn invalidate(&mut self);
 
@@ -91,6 +74,8 @@ pub trait Chart: ChartConstants + canvas::Program<Message> {
     fn interval_keys(&self) -> Option<Vec<u64>>;
 
     fn autoscaled_coords(&self) -> Vector;
+
+    fn supports_fit_autoscaling(&self) -> bool;
 
     fn is_empty(&self) -> bool;
 }
@@ -106,7 +91,7 @@ fn canvas_interaction<T: Chart>(
         *interaction = Interaction::None;
     }
 
-    if chart.common_data().bounds != bounds {
+    if chart.state().bounds != bounds {
         return Some(canvas::Action::publish(Message::BoundsChanged(bounds)));
     }
 
@@ -114,34 +99,25 @@ fn canvas_interaction<T: Chart>(
 
     match event {
         Event::Mouse(mouse_event) => {
-            let chart_state = chart.common_data();
+            let state = chart.state();
 
             match mouse_event {
                 mouse::Event::ButtonPressed(button) => {
-                    let message = match button {
-                        mouse::Button::Left => {
-                            *interaction = Interaction::Panning {
-                                translation: chart_state.translation,
-                                start: cursor_position,
-                            };
-                            None
-                        }
-                        _ => None,
-                    };
-
-                    Some(
-                        message
-                            .map_or(canvas::Action::request_redraw(), canvas::Action::publish)
-                            .and_capture(),
-                    )
+                    if let mouse::Button::Left = button {
+                        *interaction = Interaction::Panning {
+                            translation: state.translation,
+                            start: cursor_position,
+                        };
+                    }
+                    Some(canvas::Action::request_redraw().and_capture())
                 }
                 mouse::Event::CursorMoved { .. } => {
                     let message = match *interaction {
                         Interaction::Panning { translation, start } => Some(Message::Translated(
-                            translation + (cursor_position - start) * (1.0 / chart_state.scaling),
+                            translation + (cursor_position - start) * (1.0 / state.scaling),
                         )),
                         Interaction::None => {
-                            if chart_state.crosshair {
+                            if state.layout.crosshair {
                                 Some(Message::CrosshairMoved)
                             } else {
                                 None
@@ -175,35 +151,42 @@ fn canvas_interaction<T: Chart>(
                         | mouse::ScrollDelta::Pixels { y, .. } => y,
                     };
 
-                    let should_adjust_cell_width = match (y.signum(), chart_state.scaling) {
+                    if let Some(Autoscale::FitToVisible) = state.layout.autoscale {
+                        return Some(
+                            canvas::Action::publish(Message::XScaling(
+                                y / 2.0,
+                                cursor_to_center.x,
+                                false,
+                            ))
+                            .and_capture(),
+                        );
+                    }
+
+                    let should_adjust_cell_width = match (y.signum(), state.scaling) {
                         // zooming out at max scaling with increased cell width
                         (-1.0, scaling)
-                            if scaling == max_scaling
-                                && chart_state.cell_width > default_cell_width =>
+                            if scaling == max_scaling && state.cell_width > default_cell_width =>
                         {
                             true
                         }
 
                         // zooming in at min scaling with decreased cell width
                         (1.0, scaling)
-                            if scaling == min_scaling
-                                && chart_state.cell_width < default_cell_width =>
+                            if scaling == min_scaling && state.cell_width < default_cell_width =>
                         {
                             true
                         }
 
                         // zooming in at max scaling with room to increase cell width
                         (1.0, scaling)
-                            if scaling == max_scaling
-                                && chart_state.cell_width < max_cell_width =>
+                            if scaling == max_scaling && state.cell_width < max_cell_width =>
                         {
                             true
                         }
 
                         // zooming out at min scaling with room to decrease cell width
                         (-1.0, scaling)
-                            if scaling == min_scaling
-                                && chart_state.cell_width > min_cell_width =>
+                            if scaling == min_scaling && state.cell_width > min_cell_width =>
                         {
                             true
                         }
@@ -223,11 +206,11 @@ fn canvas_interaction<T: Chart>(
                     }
 
                     // normal scaling cases
-                    if (*y < 0.0 && chart_state.scaling > min_scaling)
-                        || (*y > 0.0 && chart_state.scaling < max_scaling)
+                    if (*y < 0.0 && state.scaling > min_scaling)
+                        || (*y > 0.0 && state.scaling < max_scaling)
                     {
-                        let old_scaling = chart_state.scaling;
-                        let scaling = (chart_state.scaling * (1.0 + y / ZOOM_SENSITIVITY))
+                        let old_scaling = state.scaling;
+                        let scaling = (state.scaling * (1.0 + y / ZOOM_SENSITIVITY))
                             .clamp(min_scaling, max_scaling);
 
                         let translation = {
@@ -243,7 +226,7 @@ fn canvas_interaction<T: Chart>(
                                 Vector::default()
                             };
 
-                            chart_state.translation - vector_diff
+                            state.translation - vector_diff
                         };
 
                         return Some(
@@ -270,64 +253,108 @@ pub fn update<T: Chart>(chart: &mut T, message: Message) {
     match message {
         Message::DoubleClick(scale) => {
             let default_chart_width = T::default_cell_width(chart);
+            let autoscaled_coords = chart.autoscaled_coords();
+            let supports_fit_autoscaling = chart.supports_fit_autoscaling();
 
-            let chart_state = chart.common_data_mut();
+            let state = chart.mut_state();
 
             match scale {
                 AxisScaleClicked::X => {
-                    chart_state.cell_width = default_chart_width;
+                    state.cell_width = default_chart_width;
+                    state.translation = autoscaled_coords;
                 }
                 AxisScaleClicked::Y => {
-                    chart_state.autoscale = true;
+                    if supports_fit_autoscaling {
+                        state.layout.autoscale = Some(Autoscale::FitToVisible);
+                        state.scaling = 1.0;
+                    } else {
+                        state.layout.autoscale = Some(Autoscale::CenterLatest);
+                    }
                 }
             }
         }
         Message::Translated(translation) => {
-            let chart_state = chart.common_data_mut();
-            chart_state.translation = translation;
-            chart_state.autoscale = false;
+            let state = chart.mut_state();
+
+            if let Some(Autoscale::FitToVisible) = state.layout.autoscale {
+                state.translation.x = translation.x;
+            } else {
+                state.translation = translation;
+                state.layout.autoscale = None;
+            }
         }
         Message::Scaled(scaling, translation) => {
-            let chart_state = chart.common_data_mut();
-            chart_state.scaling = scaling;
-            chart_state.translation = translation;
+            let state = chart.mut_state();
+            state.scaling = scaling;
+            state.translation = translation;
 
-            chart_state.autoscale = false;
+            state.layout.autoscale = None;
         }
         Message::AutoscaleToggle => {
-            let chart_state = chart.common_data_mut();
-            chart_state.autoscale = !chart_state.autoscale;
-            if chart_state.autoscale {
-                chart_state.scaling = 1.0;
+            let supports_fit_autoscaling = chart.supports_fit_autoscaling();
+            let state = chart.mut_state();
+
+            let current_autoscale = state.layout.autoscale;
+
+            state.layout.autoscale = Autoscale::next(current_autoscale, supports_fit_autoscaling);
+            if state.layout.autoscale.is_some() {
+                state.scaling = 1.0;
             }
         }
         Message::CrosshairToggle => {
-            let chart_state = chart.common_data_mut();
-            chart_state.crosshair = !chart_state.crosshair;
+            let state = chart.mut_state();
+            state.layout.crosshair = !state.layout.crosshair;
         }
         Message::XScaling(delta, cursor_to_center_x, is_wheel_scroll) => {
             let min_cell_width = T::min_cell_width(chart);
             let max_cell_width = T::max_cell_width(chart);
 
-            let chart_state = chart.common_data_mut();
+            let state = chart.mut_state();
 
-            if delta < 0.0 && chart_state.cell_width > min_cell_width
-                || delta > 0.0 && chart_state.cell_width < max_cell_width
+            if !(delta < 0.0 && state.cell_width > min_cell_width
+                || delta > 0.0 && state.cell_width < max_cell_width)
             {
-                let (old_scaling, old_translation_x) =
-                    { (chart_state.scaling, chart_state.translation.x) };
+                return;
+            }
 
-                let zoom_factor = if is_wheel_scroll {
-                    ZOOM_SENSITIVITY
-                } else {
-                    ZOOM_SENSITIVITY * 3.0
+            let is_fit_to_visible_zoom =
+                !is_wheel_scroll && matches!(state.layout.autoscale, Some(Autoscale::FitToVisible));
+
+            let zoom_factor = if is_fit_to_visible_zoom {
+                ZOOM_SENSITIVITY / 1.5
+            } else if is_wheel_scroll {
+                ZOOM_SENSITIVITY
+            } else {
+                ZOOM_SENSITIVITY * 3.0
+            };
+
+            let new_width = (state.cell_width * (1.0 + delta / zoom_factor))
+                .clamp(min_cell_width, max_cell_width);
+
+            if is_fit_to_visible_zoom {
+                let anchor_interval = {
+                    let latest_x_coord = state.interval_to_x(state.latest_x);
+                    if state.is_interval_x_visible(latest_x_coord) {
+                        state.latest_x
+                    } else {
+                        let visible_region = state.visible_region(state.bounds.size());
+                        state.x_to_interval(visible_region.x + visible_region.width)
+                    }
                 };
 
-                let new_width = (chart_state.cell_width * (1.0 + delta / zoom_factor))
-                    .clamp(min_cell_width, max_cell_width);
+                let old_anchor_chart_x = state.interval_to_x(anchor_interval);
 
-                let latest_x = chart_state.interval_to_x(chart_state.latest_x);
-                let is_interval_x_visible = chart_state.is_interval_x_visible(latest_x);
+                state.cell_width = new_width;
+
+                let new_anchor_chart_x = state.interval_to_x(anchor_interval);
+
+                let shift = new_anchor_chart_x - old_anchor_chart_x;
+                state.translation.x -= shift;
+            } else {
+                let (old_scaling, old_translation_x) = { (state.scaling, state.translation.x) };
+
+                let latest_x = state.interval_to_x(state.latest_x);
+                let is_interval_x_visible = state.is_interval_x_visible(latest_x);
 
                 let cursor_chart_x = {
                     if is_wheel_scroll || !is_interval_x_visible {
@@ -337,27 +364,27 @@ pub fn update<T: Chart>(chart: &mut T, message: Message) {
                     }
                 };
 
-                let new_cursor_x = match chart_state.basis {
+                let new_cursor_x = match state.basis {
                     Basis::Time(_) => {
-                        let cursor_time = chart_state.x_to_interval(cursor_chart_x);
-                        chart_state.cell_width = new_width;
+                        let cursor_time = state.x_to_interval(cursor_chart_x);
+                        state.cell_width = new_width;
 
-                        chart_state.interval_to_x(cursor_time)
+                        state.interval_to_x(cursor_time)
                     }
                     Basis::Tick(_) => {
-                        let tick_index = cursor_chart_x / chart_state.cell_width;
-                        chart_state.cell_width = new_width;
+                        let tick_index = cursor_chart_x / state.cell_width;
+                        state.cell_width = new_width;
 
-                        tick_index * chart_state.cell_width
+                        tick_index * state.cell_width
                     }
                 };
 
                 if is_wheel_scroll || !is_interval_x_visible {
                     if !new_cursor_x.is_nan() && !cursor_chart_x.is_nan() {
-                        chart_state.translation.x -= new_cursor_x - cursor_chart_x;
+                        state.translation.x -= new_cursor_x - cursor_chart_x;
                     }
 
-                    chart_state.autoscale = false;
+                    state.layout.autoscale = None;
                 }
             }
         }
@@ -365,13 +392,16 @@ pub fn update<T: Chart>(chart: &mut T, message: Message) {
             let min_cell_height = T::min_cell_height(chart);
             let max_cell_height = T::max_cell_height(chart);
 
-            let chart_state = chart.common_data_mut();
+            let state = chart.mut_state();
 
-            if delta < 0.0 && chart_state.cell_height > min_cell_height
-                || delta > 0.0 && chart_state.cell_height < max_cell_height
+            if state.layout.autoscale == Some(Autoscale::FitToVisible) {
+                state.layout.autoscale = None;
+            }
+
+            if delta < 0.0 && state.cell_height > min_cell_height
+                || delta > 0.0 && state.cell_height < max_cell_height
             {
-                let (old_scaling, old_translation_y) =
-                    { (chart_state.scaling, chart_state.translation.y) };
+                let (old_scaling, old_translation_y) = { (state.scaling, state.translation.y) };
 
                 let zoom_factor = if is_wheel_scroll {
                     ZOOM_SENSITIVITY
@@ -379,42 +409,42 @@ pub fn update<T: Chart>(chart: &mut T, message: Message) {
                     ZOOM_SENSITIVITY * 3.0
                 };
 
-                let new_height = (chart_state.cell_height * (1.0 + delta / zoom_factor))
+                let new_height = (state.cell_height * (1.0 + delta / zoom_factor))
                     .clamp(min_cell_height, max_cell_height);
 
                 let cursor_chart_y = cursor_to_center_y / old_scaling - old_translation_y;
 
-                let cursor_price = chart_state.y_to_price(cursor_chart_y);
+                let cursor_price = state.y_to_price(cursor_chart_y);
 
-                chart_state.cell_height = new_height;
+                state.cell_height = new_height;
 
-                let new_cursor_y = chart_state.price_to_y(cursor_price);
+                let new_cursor_y = state.price_to_y(cursor_price);
 
-                chart_state.translation.y -= new_cursor_y - cursor_chart_y;
+                state.translation.y -= new_cursor_y - cursor_chart_y;
 
                 if is_wheel_scroll {
-                    chart_state.autoscale = false;
+                    state.layout.autoscale = None;
                 }
             }
         }
         Message::BoundsChanged(bounds) => {
-            let chart_state = chart.common_data_mut();
+            let state = chart.mut_state();
 
             // calculate how center shifted
-            let old_center_x = chart_state.bounds.width / 2.0;
+            let old_center_x = state.bounds.width / 2.0;
             let new_center_x = bounds.width / 2.0;
-            let center_delta_x = (new_center_x - old_center_x) / chart_state.scaling;
+            let center_delta_x = (new_center_x - old_center_x) / state.scaling;
 
-            chart_state.bounds = bounds;
+            state.bounds = bounds;
 
-            if !chart_state.autoscale {
-                chart_state.translation.x += center_delta_x;
+            if state.layout.autoscale != Some(Autoscale::CenterLatest) {
+                state.translation.x += center_delta_x;
             }
         }
         Message::SplitDragged(split, size) => {
-            let chart_state = chart.common_data_mut();
+            let state = chart.mut_state();
 
-            if let Some(split) = chart_state.splits.get_mut(split) {
+            if let Some(split) = state.layout.splits.get_mut(split) {
                 *split = (size * 100.0).round() / 100.0;
             }
         }
@@ -429,70 +459,83 @@ pub fn view<'a, T: Chart>(
     indicators: &'a [T::IndicatorType],
     timezone: data::UserTimezone,
 ) -> Element<'a, Message> {
-    let chart_state = chart.common_data();
+    let state = chart.state();
 
     if chart.is_empty() {
         return center(text("Waiting for data...").size(16)).into();
     }
 
     let axis_labels_x = Canvas::new(AxisLabelsX {
-        labels_cache: &chart_state.cache.x_labels,
-        scaling: chart_state.scaling,
-        translation_x: chart_state.translation.x,
-        max: chart_state.latest_x,
-        crosshair: chart_state.crosshair,
-        basis: chart_state.basis,
-        cell_width: chart_state.cell_width,
+        labels_cache: &state.cache.x_labels,
+        scaling: state.scaling,
+        translation_x: state.translation.x,
+        max: state.latest_x,
+        crosshair: state.layout.crosshair,
+        basis: state.basis,
+        cell_width: state.cell_width,
         timezone,
-        chart_bounds: chart_state.bounds,
+        chart_bounds: state.bounds,
         interval_keys: chart.interval_keys(),
+        autoscaling: state.layout.autoscale,
     })
     .width(Length::Fill)
     .height(Length::Fill);
 
-    let chart_controls = {
-        let center_button = button(text("C").size(10).align_x(alignment::Horizontal::Center))
-            .width(Length::Shrink)
-            .height(Length::Fill)
-            .on_press(Message::AutoscaleToggle)
-            .style(move |theme, status| {
-                style::button::transparent(theme, status, chart_state.autoscale)
-            });
+    let buttons = {
+        let (autoscale_btn_placeholder, autoscale_btn_tooltip) = match state.layout.autoscale {
+            Some(Autoscale::CenterLatest) => (text("C"), Some("Center last price")),
+            Some(Autoscale::FitToVisible) => (text("A"), Some("Auto")),
+            None => (text("C"), None),
+        };
+
+        let autoscale_button = button(
+            autoscale_btn_placeholder
+                .size(10)
+                .align_x(alignment::Horizontal::Center),
+        )
+        .width(Length::Shrink)
+        .height(Length::Fill)
+        .on_press(Message::AutoscaleToggle)
+        .style(move |theme, status| {
+            style::button::transparent(theme, status, state.layout.autoscale.is_some())
+        });
 
         let crosshair_button = button(text("+").size(10).align_x(alignment::Horizontal::Center))
             .width(Length::Shrink)
             .height(Length::Fill)
             .on_press(Message::CrosshairToggle)
             .style(move |theme, status| {
-                style::button::transparent(theme, status, chart_state.crosshair)
+                style::button::transparent(theme, status, state.layout.crosshair)
             });
+
+        let tooltip_pos = iced::widget::tooltip::Position::Top;
 
         container(
             row![
                 Space::new(Length::Fill, Length::Fill),
-                tooltip(center_button, Some("Center Latest"), TooltipPosition::Top),
-                tooltip(crosshair_button, Some("Crosshair"), TooltipPosition::Top),
+                tooltip(autoscale_button, autoscale_btn_tooltip, tooltip_pos),
+                tooltip(crosshair_button, Some("Crosshair"), tooltip_pos),
             ]
             .spacing(2),
         )
         .padding(2)
     };
 
-    let y_labels_width = chart_state.y_labels_width();
+    let y_labels_width = state.y_labels_width();
 
-    let chart_content = {
+    let content = {
         let axis_labels_y = Canvas::new(AxisLabelsY {
-            labels_cache: &chart_state.cache.y_labels,
-            translation_y: chart_state.translation.y,
-            scaling: chart_state.scaling,
-            decimals: chart_state.decimals,
-            min: chart_state.base_price_y,
-            last_price: chart_state.last_price,
-            crosshair: chart_state.crosshair,
-            tick_size: chart_state.tick_size,
-            cell_height: chart_state.cell_height,
-            basis: chart_state.basis,
-            chart_bounds: chart_state.bounds,
+            labels_cache: &state.cache.y_labels,
+            translation_y: state.translation.y,
+            scaling: state.scaling,
+            decimals: state.decimals,
+            min: state.base_price_y,
+            last_price: state.last_price,
+            crosshair: state.layout.crosshair,
+            tick_size: state.tick_size,
+            cell_height: state.cell_height,
+            basis: state.basis,
+            chart_bounds: state.bounds,
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -520,7 +563,7 @@ pub fn view<'a, T: Chart>(
                 .chain(indicators)
                 .collect::<Vec<_>>();
 
-            MultiSplit::new(panels, &chart_state.splits, |index, position| {
+            MultiSplit::new(panels, &state.layout.splits, |index, position| {
                 Message::SplitDragged(index, position)
             })
             .into()
@@ -528,7 +571,7 @@ pub fn view<'a, T: Chart>(
     };
 
     column![
-        chart_content,
+        content,
         horizontal_rule(1).style(style::split_ruler),
         row![
             container(
@@ -538,9 +581,7 @@ pub fn view<'a, T: Chart>(
             .padding(padding::right(1))
             .width(Length::FillPortion(10))
             .height(Length::Fixed(26.0)),
-            chart_controls
-                .width(y_labels_width)
-                .height(Length::Fixed(26.0))
+            buttons.width(y_labels_width).height(Length::Fixed(26.0))
         ]
     ]
     .padding(1)
@@ -564,99 +605,45 @@ impl Caches {
     }
 }
 
-enum ChartData {
-    TimeBased(TimeSeries),
-    TickBased(TickAggr),
-}
-
-impl ChartData {
-    pub fn latest_y_midpoint(&self, chart: &CommonChartData) -> f32 {
-        let calculate_target_y = |kline: exchange::Kline| -> f32 {
-            let y_low = chart.price_to_y(kline.low);
-            let y_high = chart.price_to_y(kline.high);
-            let y_close = chart.price_to_y(kline.close);
-
-            let mut target_y_translation = -(y_low + y_high) / 2.0;
-
-            if chart.bounds.height > f32::EPSILON && chart.scaling > f32::EPSILON {
-                let visible_half_height = (chart.bounds.height / chart.scaling) / 2.0;
-
-                let view_center_y_centered = -target_y_translation;
-
-                let visible_y_top = view_center_y_centered - visible_half_height;
-                let visible_y_bottom = view_center_y_centered + visible_half_height;
-
-                let padding = chart.cell_height;
-
-                if y_close < visible_y_top {
-                    target_y_translation = -(y_close - padding + visible_half_height);
-                } else if y_close > visible_y_bottom {
-                    target_y_translation = -(y_close + padding - visible_half_height);
-                }
-            }
-            target_y_translation
-        };
-
-        match self {
-            ChartData::TimeBased(timeseries) => timeseries
-                .latest_kline()
-                .map_or(0.0, |kline| calculate_target_y(*kline)),
-            ChartData::TickBased(tick_aggr) => tick_aggr
-                .latest_dp()
-                .map_or(0.0, |(dp, _)| calculate_target_y(dp.kline)),
-        }
-    }
-}
-
-pub struct CommonChartData {
+pub struct ViewState {
     cache: Caches,
-
-    crosshair: bool,
     bounds: Rectangle,
-
-    autoscale: bool,
-
     translation: Vector,
     scaling: f32,
     cell_width: f32,
     cell_height: f32,
     basis: Basis,
-
     last_price: Option<PriceInfoLabel>,
-
     base_price_y: f32,
     latest_x: u64,
     tick_size: f32,
     decimals: usize,
     ticker_info: Option<TickerInfo>,
-
-    splits: Vec<f32>,
+    layout: ChartLayout,
 }
 
-impl Default for CommonChartData {
+impl Default for ViewState {
     fn default() -> Self {
-        CommonChartData {
+        ViewState {
             cache: Caches::default(),
-            crosshair: true,
             translation: Vector::default(),
             bounds: Rectangle::default(),
             basis: Timeframe::M5.into(),
             last_price: None,
             scaling: 1.0,
-            autoscale: true,
-            cell_width: DEFAULT_CELL_WIDTH,
-            cell_height: DEFAULT_CELL_HEIGHT,
+            cell_width: 4.0,
+            cell_height: 3.0,
             base_price_y: 0.0,
             latest_x: 0,
             tick_size: 0.0,
             decimals: 0,
             ticker_info: None,
-            splits: vec![],
+            layout: ChartLayout::default(),
         }
     }
 }
 
-impl CommonChartData {
+impl ViewState {
     fn visible_region(&self, size: Size) -> Rectangle {
         let width = size.width / self.scaling;
         let height = size.height / self.scaling;
@@ -854,14 +841,16 @@ impl CommonChartData {
         }
     }
 
-    fn get_chart_layout(&self) -> ChartLayout {
+    fn layout(&self) -> ChartLayout {
+        let layout = &self.layout;
         ChartLayout {
-            crosshair: self.crosshair,
-            splits: self.splits.clone(),
+            crosshair: layout.crosshair,
+            splits: layout.splits.clone(),
+            autoscale: layout.autoscale,
         }
     }
 
-    pub fn y_labels_width(&self) -> Length {
+    fn y_labels_width(&self) -> Length {
         let base_value = self.base_price_y;
         let decimals = self.decimals;
 
