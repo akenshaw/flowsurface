@@ -1,3 +1,4 @@
+pub mod comparison;
 pub mod heatmap;
 pub mod indicator;
 pub mod kline;
@@ -64,6 +65,7 @@ pub enum VisualConfig {
     Heatmap(heatmap::Config),
     TimeAndSales(timeandsales::Config),
     Kline(kline::Config),
+    Comparison(comparison::Config),
 }
 
 impl VisualConfig {
@@ -84,6 +86,13 @@ impl VisualConfig {
     pub fn kline(&self) -> Option<kline::Config> {
         match self {
             Self::Kline(cfg) => Some(*cfg),
+            _ => None,
+        }
+    }
+
+    pub fn comparison(&self) -> Option<comparison::Config> {
+        match self {
+            Self::Comparison(cfg) => Some(*cfg),
             _ => None,
         }
     }

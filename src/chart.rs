@@ -863,7 +863,7 @@ impl ViewState {
     }
 }
 
-fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Action> {
+pub fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Action> {
     match handler.add_request(range) {
         Ok(Some(req_id)) => Some(Action::FetchRequested(req_id, range)),
         Ok(None) => None,

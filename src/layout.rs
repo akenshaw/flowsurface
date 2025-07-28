@@ -132,6 +132,12 @@ impl From<&pane::State> for data::Pane {
                 settings: pane.settings,
                 link_group: pane.link_group,
             },
+            pane::Content::Comparison(_chart, indicators) => data::Pane::ComparisonChart {
+                stream_type: streams,
+                settings: pane.settings,
+                indicators: indicators.clone(),
+                link_group: pane.link_group,
+            },
         }
     }
 }
@@ -270,6 +276,35 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
                 }
             }
         },
+        data::Pane::ComparisonChart {
+            stream_type,
+            settings,
+            indicators,
+            link_group,
+        } => {
+            if settings.ticker_info.is_none() {
+                log::info!("Skipping a ComparisonChart initialization due to missing ticker info");
+                return Configuration::Pane(pane::State::new());
+            }
+
+            let config = settings.visual_config.and_then(|cfg| cfg.comparison());
+
+            Configuration::Pane(pane::State::from_config(
+                pane::Content::Comparison(
+                    crate::comparison::ComparisonChart::new(
+                        config,
+                        [].to_vec(),
+                        settings
+                            .selected_basis
+                            .unwrap_or(Basis::Time(Timeframe::M5)),
+                    ),
+                    indicators,
+                ),
+                stream_type,
+                settings,
+                link_group,
+            ))
+        }
         data::Pane::TimeAndSales {
             stream_type,
             settings,

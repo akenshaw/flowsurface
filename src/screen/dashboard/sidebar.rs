@@ -7,6 +7,7 @@ use crate::{
 };
 use data::sidebar;
 
+use exchange::TickerInfo;
 use iced::{
     Alignment, Element, Length, Subscription, Task,
     widget::responsive,
@@ -224,5 +225,9 @@ impl Sidebar {
             .iter()
             .map(|(exchange, ticker)| (*exchange, *ticker))
             .collect()
+    }
+
+    pub fn available_tickers(&self) -> &Vec<TickerInfo> {
+        &self.tickers_table.available_tickers
     }
 }

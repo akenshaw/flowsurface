@@ -1,7 +1,7 @@
 use crate::screen::dashboard::pane::Message;
 use crate::screen::dashboard::panel::timeandsales;
-use crate::split_column;
 use crate::widget::{classic_slider_row, labeled_slider};
+use crate::{comparison, split_column};
 use crate::{style, tooltip, widget::scrollable_content};
 use data::chart::heatmap::HeatmapStudy;
 use data::chart::kline::FootprintStudy;
@@ -12,6 +12,7 @@ use data::chart::{
     timeandsales::StackedBarRatio,
 };
 use data::util::format_with_commas;
+use iced::widget::center;
 use iced::{
     Alignment, Element, Length,
     widget::{
@@ -30,6 +31,17 @@ where
         .max_width(max_width)
         .style(style::chart_modal)
         .into()
+}
+
+pub fn comparison_cfg_view<'a>(
+    cfg: &data::chart::comparison::Config,
+    pane: pane_grid::Pane,
+) -> Element<'a, Message> {
+    let content = column![center(text("NOTHING HEIA"))]
+        .spacing(12)
+        .align_x(Alignment::Start);
+
+    cfg_view_container(240, content)
 }
 
 pub fn heatmap_cfg_view<'a>(

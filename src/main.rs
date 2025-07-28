@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod chart;
+mod comparison;
 mod layout;
 mod logger;
 mod modal;
@@ -432,6 +433,8 @@ impl Flowsurface {
         let dashboard = self.active_dashboard();
         let sidebar_pos = self.sidebar.position();
 
+        let available_tickers = self.sidebar.available_tickers();
+
         let content = if id == self.main_window.id {
             let sidebar_view = self
                 .sidebar
@@ -439,7 +442,7 @@ impl Flowsurface {
                 .map(Message::Sidebar);
 
             let dashboard_view = dashboard
-                .view(&self.main_window, self.timezone)
+                .view(&self.main_window, &available_tickers, self.timezone)
                 .map(move |msg| Message::Dashboard(None, msg));
 
             let header_title = {
@@ -482,7 +485,7 @@ impl Flowsurface {
         } else {
             container(
                 dashboard
-                    .view_window(id, &self.main_window, self.timezone)
+                    .view_window(id, &self.main_window, &available_tickers, self.timezone)
                     .map(move |msg| Message::Dashboard(None, msg)),
             )
             .padding(padding::top(style::TITLE_PADDING_TOP))

@@ -55,12 +55,12 @@ pub enum TickerTab {
 }
 
 #[derive(Clone)]
-struct TickerRowData {
-    exchange: Exchange,
-    ticker: Ticker,
-    stats: TickerStats,
-    previous_stats: Option<TickerStats>,
-    is_favorited: bool,
+pub struct TickerRowData {
+    pub exchange: Exchange,
+    pub ticker: Ticker,
+    pub stats: TickerStats,
+    pub previous_stats: Option<TickerStats>,
+    pub is_favorited: bool,
 }
 
 #[derive(Clone)]
@@ -102,7 +102,7 @@ pub enum Message {
 }
 
 pub struct TickersTable {
-    ticker_rows: Vec<TickerRowData>,
+    pub ticker_rows: Vec<TickerRowData>,
     pub favorited_tickers: HashSet<(Exchange, Ticker)>,
     display_cache: HashMap<(Exchange, Ticker), TickerDisplayData>,
     selected_tab: TickerTab,
@@ -113,7 +113,8 @@ pub struct TickersTable {
     pub expand_ticker_card: Option<(Ticker, Exchange)>,
     scroll_offset: AbsoluteOffset,
     pub is_shown: bool,
-    tickers_info: HashMap<Exchange, HashMap<Ticker, Option<TickerInfo>>>,
+    pub tickers_info: HashMap<Exchange, HashMap<Ticker, Option<TickerInfo>>>,
+    pub available_tickers: Vec<TickerInfo>,
 }
 
 impl TickersTable {
@@ -132,6 +133,7 @@ impl TickersTable {
                 selected_market: None,
                 is_shown: false,
                 tickers_info: HashMap::new(),
+                available_tickers: Vec::new(),
             },
             fetch_tickers_info(),
         )
@@ -283,6 +285,15 @@ impl TickersTable {
 
             Err(err) => Message::ErrorOccurred(InternalError::Fetch(err.to_string())),
         });
+
+        if let Some(tickers) = self.tickers_info.get(&exchange) {
+            self.available_tickers.extend(
+                tickers
+                    .values()
+                    .filter_map(|info| info.clone())
+                    .collect::<Vec<TickerInfo>>(),
+            );
+        }
 
         Action::Fetch(task)
     }
@@ -786,6 +797,7 @@ fn create_expanded_ticker_card<'a>(
             init_content_button("Footprint Chart", "footprint", *ticker, exchange, 180.0),
             init_content_button("Candlestick Chart", "candlestick", *ticker, exchange, 180.0),
             init_content_button("Time&Sales", "time&sales", *ticker, exchange, 160.0),
+            init_content_button("Comparison Chart", "comparison", *ticker, exchange, 180.0),
         ]
         .width(Length::Fill)
         .spacing(2)

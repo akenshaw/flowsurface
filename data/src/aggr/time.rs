@@ -26,6 +26,7 @@ pub trait DataPoint {
     fn value_low(&self) -> f32;
 }
 
+#[derive(Clone, Debug)]
 pub struct TimeSeries<D: DataPoint> {
     pub datapoints: BTreeMap<u64, D>,
     pub interval: Timeframe,

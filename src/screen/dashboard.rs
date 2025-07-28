@@ -428,6 +428,7 @@ impl Dashboard {
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         if let Some(pane::Modal::StreamModifier(mut modifier)) = state.modal {
                             let action = modifier.update(message);
+                            let pane_id = state.unique_id();
 
                             match action {
                                 Some(modal::stream::Action::TabSelected(tab)) => {
@@ -439,15 +440,30 @@ impl Dashboard {
                                     modifier.update_kind_with_basis(new_basis);
 
                                     state.modal = Some(pane::Modal::StreamModifier(modifier));
-
                                     state.settings.selected_basis = Some(new_basis);
 
                                     if let pane::Content::Heatmap(ref mut chart, _) = state.content
                                     {
                                         chart.set_basis(new_basis);
                                         return (Task::none(), None);
+                                    } else if let pane::Content::Comparison(_, _) = state.content {
+                                        let new_timeframe = match new_basis {
+                                            Basis::Time(timeframe) => timeframe,
+                                            Basis::Tick(_) => panic!(
+                                                "Tick basis is not supported in comparison chart"
+                                            ),
+                                        };
+
+                                        state.streams.iter_mut().for_each(|stream| {
+                                            if let StreamKind::Kline { timeframe, .. } = stream {
+                                                *timeframe = new_timeframe.into();
+                                            }
+                                        });
+
+                                        return (self.refresh_streams(main_window.id), None);
                                     }
 
+                                    // KlineChart stream handling
                                     if let Some((exchange, ticker)) = state.stream_pair() {
                                         let chart_kind =
                                             state.content.chart_kind().unwrap_or_default();
@@ -472,9 +488,6 @@ impl Dashboard {
                                                 }
 
                                                 state.streams = streams;
-
-                                                let pane_id = state.unique_id();
-
                                                 state.settings.selected_basis =
                                                     Some(Basis::Time(new_tf));
 
@@ -568,6 +581,37 @@ impl Dashboard {
                                 None => {
                                     state.modal = Some(pane::Modal::StreamModifier(modifier));
                                 }
+                            }
+                        }
+                    }
+                }
+                pane::Message::UpdateSearchQuery(pane, search_query) => {
+                    if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
+                        if matches!(state.modal, Some(pane::Modal::MiniTickersList(_))) {
+                            state.modal = Some(pane::Modal::MiniTickersList(Some(search_query)));
+                        }
+                    }
+                }
+                pane::Message::UnselectTicker(pane, ticker) => {
+                    if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
+                        if let pane::Content::Comparison(ref mut chart, _) = state.content {
+                            chart
+                                .tickers
+                                .retain(|t| t.ticker != ticker || t.exchange() != ticker.exchange);
+                            chart.data.remove(&ticker);
+                        }
+                    }
+                }
+                pane::Message::SelectTicker(pane, ticker) => {
+                    if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
+                        if let pane::Content::Comparison(ref mut chart, _) = state.content {
+                            let exchange = ticker.exchange();
+                            if !chart
+                                .tickers
+                                .iter()
+                                .any(|t| t.ticker == ticker.ticker && t.exchange() == exchange)
+                            {
+                                chart.tickers.push(ticker.clone());
                             }
                         }
                     }
@@ -769,6 +813,7 @@ impl Dashboard {
     pub fn view<'a>(
         &'a self,
         main_window: &'a Window,
+        tickers: &'a Vec<TickerInfo>,
         timezone: UserTimezone,
     ) -> Element<'a, Message> {
         let pane_grid: Element<_> = PaneGrid::new(&self.panes, |id, pane, maximized| {
@@ -781,6 +826,7 @@ impl Dashboard {
                 main_window.id,
                 main_window,
                 timezone,
+                tickers,
             )
         })
         .min_size(240)
@@ -798,6 +844,7 @@ impl Dashboard {
         &'a self,
         window: window::Id,
         main_window: &'a Window,
+        tickers: &'a [TickerInfo],
         timezone: UserTimezone,
     ) -> Element<'a, Message> {
         if let Some((state, _)) = self.popout.get(&window) {
@@ -812,6 +859,7 @@ impl Dashboard {
                         window,
                         main_window,
                         timezone,
+                        tickers,
                     )
                 })
                 .on_click(pane::Message::PaneClicked),
@@ -1034,7 +1082,7 @@ impl Dashboard {
                     pane_state.status = pane::Status::Ready;
 
                     if let StreamKind::Kline { timeframe, .. } = stream_type {
-                        pane_state.insert_klines_vec(req_id, timeframe, &data);
+                        pane_state.insert_klines_vec(&stream_type, req_id, timeframe, &data);
                     }
                 }
             }
@@ -1106,6 +1154,25 @@ impl Dashboard {
                 if pane_state.matches_stream(stream) {
                     if let pane::Content::Kline(chart, _) = &mut pane_state.content {
                         chart.update_latest_kline(kline);
+                    }
+
+                    match &mut pane_state.content {
+                        pane::Content::Kline(chart, _) => {
+                            chart.update_latest_kline(kline);
+                        }
+                        pane::Content::Comparison(chart, _) => match stream {
+                            StreamKind::Kline {
+                                ticker, timeframe, ..
+                            } => {
+                                chart.insert_klines(*ticker, &vec![kline.clone()], *timeframe);
+                            }
+                            _ => {
+                                log::error!(
+                                    "Comparison chart received non-kline stream: {stream:?}"
+                                );
+                            }
+                        },
+                        _ => {}
                     }
 
                     found_match = true;
