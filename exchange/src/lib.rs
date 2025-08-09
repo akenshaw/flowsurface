@@ -198,6 +198,7 @@ impl SerTicker {
             Exchange::BybitLinear => "BybitLinear",
             Exchange::BybitInverse => "BybitInverse",
             Exchange::BybitSpot => "BybitSpot",
+            Exchange::HyperliquidLinear => "HyperliquidLinear",
         }
     }
 
@@ -209,6 +210,7 @@ impl SerTicker {
             "BybitLinear" => Ok(Exchange::BybitLinear),
             "BybitInverse" => Ok(Exchange::BybitInverse),
             "BybitSpot" => Ok(Exchange::BybitSpot),
+            "HyperliquidLinear" => Ok(Exchange::HyperliquidLinear),
             _ => Err(format!("Unknown exchange: {}", s)),
         }
     }
@@ -272,10 +274,12 @@ impl Ticker {
 
         assert!(base_len <= 20, "Ticker too long");
         assert!(
-            ticker
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-            "Ticker must contain only ASCII alphanumeric characters and underscores: {ticker:?}"
+            ticker.chars().all(|c| c.is_ascii_alphanumeric()
+                || c == '_'
+                || c == '-'
+                || c == '.'
+                || c == '/'),
+            "Ticker must contain only ASCII alphanumeric characters, underscores, hyphens, dots, and slashes: {ticker:?}"
         );
 
         let mut data = [0u64; 2];
@@ -285,7 +289,11 @@ impl Ticker {
             let value = match c {
                 b'0'..=b'9' => c - b'0',
                 b'A'..=b'Z' => c - b'A' + 10,
+                b'a'..=b'z' => c - b'a' + 10, // Convert lowercase to same as uppercase
                 b'_' => 36,
+                b'-' => 37, // Hyphen for symbols like ATOM-USD
+                b'.' => 38, // Dot for symbols like 1000LUNC.P
+                b'/' => 39, // Slash for symbols like PURR/USDC
                 _ => unreachable!(),
             };
             let shift = (i % 10) * 6;
@@ -322,19 +330,29 @@ impl Ticker {
         for i in 0..self.len {
             let value = (self.data[i as usize / 10] >> ((i % 10) * 6)) & 0x3F;
 
-            if value == 36 {
-                break;
-            }
-
             let c = match value {
                 0..=9 => (b'0' + value as u8) as char,
                 10..=35 => (b'A' + (value as u8 - 10)) as char,
+                36 => '_',
+                37 => '-',
+                38 => '.',
+                39 => '/',
                 _ => unreachable!(),
             };
             result.push(c);
         }
 
-        (result, self.market_type())
+        let market_kind = self.market_type();
+        // Transform Hyperliquid symbols to standardized display format
+        if matches!(self.exchange, Exchange::HyperliquidLinear) {
+            // For Hyperliquid Linear Perps, append USDT to match other exchanges' format
+            // The "P" suffix will be added later in compute_display_data for all perpetual contracts
+            if market_kind == MarketKind::LinearPerps {
+                result.push_str("USDT");
+            }
+        }
+
+        (result, market_kind)
     }
 
     pub fn market_type(&self) -> MarketKind {
@@ -350,6 +368,9 @@ impl fmt::Display for Ticker {
                 0..=9 => (b'0' + value as u8) as char,
                 10..=35 => (b'A' + (value as u8 - 10)) as char,
                 36 => '_',
+                37 => '-',
+                38 => '.',
+                39 => '/',
                 _ => unreachable!(),
             };
             f.write_char(c)?;

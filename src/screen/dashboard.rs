@@ -18,6 +18,7 @@ use exchange::{
     Kline, Ticker, TickerInfo, Timeframe, Trade,
     adapter::{
         self, AdapterError, Exchange, StreamConfig, StreamKind, UniqueStreams, binance, bybit,
+        hyperliquid,
     },
     depth::Depth,
     fetcher::{FetchRange, FetchedData},
@@ -1471,6 +1472,10 @@ pub fn depth_subscription(ticker: Ticker) -> Subscription<exchange::Event> {
             let builder = |cfg: &StreamConfig<Ticker>| bybit::connect_market_stream(cfg.id);
             Subscription::run_with(config, builder)
         }
+        Exchange::HyperliquidLinear => {
+            let builder = |cfg: &StreamConfig<Ticker>| hyperliquid::connect_market_stream(cfg.id);
+            Subscription::run_with(config, builder)
+        }
     }
 }
 
@@ -1489,6 +1494,12 @@ pub fn kline_subscription(
         Exchange::BybitSpot | Exchange::BybitInverse | Exchange::BybitLinear => {
             let builder = |cfg: &StreamConfig<Vec<(Ticker, Timeframe)>>| {
                 bybit::connect_kline_stream(cfg.id.clone(), cfg.market_type)
+            };
+            Subscription::run_with(config, builder)
+        }
+        Exchange::HyperliquidLinear => {
+            let builder = |cfg: &StreamConfig<Vec<(Ticker, Timeframe)>>| {
+                hyperliquid::connect_kline_stream(cfg.id.clone(), cfg.market_type)
             };
             Subscription::run_with(config, builder)
         }
