@@ -9,7 +9,7 @@ use crate::{
     },
     screen::{
         DashboardError,
-        dashboard::panel::{self, timeandsales::TimeAndSales},
+        dashboard::panel::{self, timeandsales::TimeAndSales, orderbook::Orderbook},
     },
     style::{self, Icon, icon_text},
     widget::{self, button_with_tooltip, column_drag, link_group_button, toast::Toast},
@@ -272,6 +272,22 @@ impl State {
                 }];
                 Ok((content, streams))
             }
+            "orderbook" => {
+                let config = self
+                    .settings
+                    .visual_config
+                    .and_then(|cfg| cfg.orderbook());
+                let content = Content::Orderbook(Orderbook::new(config, Some(ticker_info)));
+                let streams = vec![StreamKind::DepthAndTrades {
+                    ticker,
+                    depth_aggr: if ticker.exchange.is_depth_client_aggr() {
+                        StreamTicksize::Client
+                    } else {
+                        StreamTicksize::ServerSide(TickMultiplier(1))
+                    },
+                }];
+                Ok((content, streams))
+            }
             _ => Err(DashboardError::PaneSet(
                 "A content must be set first.".to_string(),
             )),
@@ -421,6 +437,18 @@ impl State {
                     .map(move |message| Message::PanelInteraction(id, message));
 
                 let settings_modal = || modal::pane::settings::timesales_cfg_view(panel.config, id);
+
+                self.compose_panel_view(base, id, compact_controls, settings_modal)
+            }
+            Content::Orderbook(panel) => {
+                let base = panel::view(panel, timezone)
+                    .map(move |message| Message::PanelInteraction(id, message));
+
+                let settings_modal = || {
+                    let current_price = panel.current_price();
+                    let tick_size = panel.tick_size();
+                    modal::pane::settings::orderbook_cfg_view(panel.config, id, current_price, tick_size)
+                };
 
                 self.compose_panel_view(base, id, compact_controls, settings_modal)
             }
@@ -787,6 +815,7 @@ impl State {
             Content::Heatmap(chart, _) => chart.invalidate(Some(now)).map(Action::Chart),
             Content::Kline(chart, _) => chart.invalidate(Some(now)).map(Action::Chart),
             Content::TimeAndSales(panel) => panel.invalidate(Some(now)).map(Action::Panel),
+            Content::Orderbook(panel) => panel.invalidate(Some(now)).map(Action::Panel),
             Content::Starter => None,
         }
     }
@@ -796,6 +825,7 @@ impl State {
             Content::Kline(_, _) => Some(1000),
             Content::Heatmap(chart, _) => chart.basis_interval(),
             Content::TimeAndSales(_) => Some(100),
+            Content::Orderbook(_) => Some(100),
             Content::Starter => None,
         }
     }
@@ -861,6 +891,7 @@ pub enum Content {
     Heatmap(HeatmapChart, Vec<HeatmapIndicator>),
     Kline(KlineChart, Vec<KlineIndicator>),
     TimeAndSales(TimeAndSales),
+    Orderbook(Orderbook),
 }
 
 impl Content {
@@ -1003,6 +1034,7 @@ impl Content {
             Content::Heatmap(chart, _) => Some(chart.last_update()),
             Content::Kline(chart, _) => Some(chart.last_update()),
             Content::TimeAndSales(panel) => Some(panel.last_update()),
+            Content::Orderbook(panel) => Some(panel.last_update()),
             Content::Starter => None,
         }
     }
@@ -1040,7 +1072,7 @@ impl Content {
         match self {
             Content::Heatmap(_, indicator) => column_drag::reorder_vec(indicator, event),
             Content::Kline(_, indicator) => column_drag::reorder_vec(indicator, event),
-            Content::TimeAndSales(_) | Content::Starter => {
+            Content::TimeAndSales(_) | Content::Orderbook(_) | Content::Starter => {
                 panic!("indicator reorder on {} pane", self)
             }
         }
@@ -1054,6 +1086,9 @@ impl Content {
             (Content::TimeAndSales(panel), VisualConfig::TimeAndSales(cfg)) => {
                 panel.config = cfg;
             }
+            (Content::Orderbook(panel), VisualConfig::Orderbook(cfg)) => {
+                panel.config = cfg;
+            }
             _ => {}
         }
     }
@@ -1062,7 +1097,7 @@ impl Content {
         match &self {
             Content::Heatmap(chart, _) => Some(data::chart::Study::Heatmap(chart.studies.clone())),
             Content::Kline(chart, _) => chart.studies().map(data::chart::Study::Footprint),
-            Content::TimeAndSales(_) | Content::Starter => None,
+            Content::TimeAndSales(_) | Content::Orderbook(_) | Content::Starter => None,
         }
     }
 
@@ -1087,6 +1122,7 @@ impl Content {
                 data::chart::KlineChartKind::Candles => "candlestick".to_string(),
             },
             Content::TimeAndSales(_) => "time&sales".to_string(),
+            Content::Orderbook(_) => "orderbook".to_string(),
         }
     }
 }
@@ -1105,6 +1141,7 @@ impl std::fmt::Display for Content {
                 }
             },
             Content::TimeAndSales(_) => write!(f, "Time&Sales"),
+            Content::Orderbook(_) => write!(f, "Orderbook"),
         }
     }
 }
@@ -1117,6 +1154,7 @@ impl PartialEq for Content {
                 | (Content::Heatmap(_, _), Content::Heatmap(_, _))
                 | (Content::Kline(_, _), Content::Kline(_, _))
                 | (Content::TimeAndSales(_), Content::TimeAndSales(_))
+                | (Content::Orderbook(_), Content::Orderbook(_))
         )
     }
 }
