@@ -1,6 +1,7 @@
 pub mod heatmap;
 pub mod indicator;
 pub mod kline;
+pub mod orderbook;
 pub mod timeandsales;
 
 use exchange::Timeframe;
@@ -64,6 +65,7 @@ pub enum VisualConfig {
     Heatmap(heatmap::Config),
     TimeAndSales(timeandsales::Config),
     Kline(kline::Config),
+    Orderbook(orderbook::Config),
 }
 
 impl VisualConfig {
@@ -84,6 +86,13 @@ impl VisualConfig {
     pub fn kline(&self) -> Option<kline::Config> {
         match self {
             Self::Kline(cfg) => Some(*cfg),
+            _ => None,
+        }
+    }
+
+    pub fn orderbook(&self) -> Option<orderbook::Config> {
+        match self {
+            Self::Orderbook(cfg) => Some(*cfg),
             _ => None,
         }
     }

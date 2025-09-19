@@ -1,3 +1,4 @@
+pub mod orderbook;
 pub mod timeandsales;
 
 use iced::{

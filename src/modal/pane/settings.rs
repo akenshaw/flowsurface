@@ -5,6 +5,7 @@ use crate::widget::{classic_slider_row, labeled_slider};
 use crate::{style, tooltip, widget::scrollable_content};
 use data::chart::heatmap::HeatmapStudy;
 use data::chart::kline::FootprintStudy;
+use data::chart::orderbook;
 use data::chart::{
     KlineChartKind, VisualConfig,
     heatmap::{self, CoalesceKind},
@@ -428,6 +429,33 @@ pub fn kline_cfg_view<'a>(
     };
 
     cfg_view_container(360, content)
+}
+
+pub fn orderbook_cfg_view<'a>(
+    cfg: orderbook::Config,
+    pane: pane_grid::Pane,
+    _current_price: Option<f32>,
+    _tick_size: Option<f32>,
+) -> Element<'a, Message> {
+    let show_spread_toggle = {
+        let checkbox =
+            iced::widget::checkbox("Show Spread", cfg.show_spread).on_toggle(move |value| {
+                Message::VisualConfigChanged(
+                    pane,
+                    VisualConfig::Orderbook(orderbook::Config { show_spread: value }),
+                    false,
+                )
+            });
+
+        column![text("Display Options").size(14), checkbox].spacing(8)
+    };
+
+    let content = split_column![
+        show_spread_toggle;
+        spacing = 12, align_x = Alignment::Start
+    ];
+
+    cfg_view_container(320, content)
 }
 
 fn sync_all_button<'a>(pane: pane_grid::Pane, config: VisualConfig) -> Element<'a, Message> {
